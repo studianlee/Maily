@@ -1,0 +1,157 @@
+import { useState, useEffect } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { readText } from "@tauri-apps/plugin-clipboard-manager";
+import { register, unregister } from "@tauri-apps/plugin-global-shortcut";
+import "./App.css";
+
+type EmailTone = "accept" | "decline" | "inquiry" | "formal" | "casual";
+
+function App() {
+  const [inputText, setInputText] = useState("");
+  const [generatedResponse, setGeneratedResponse] = useState("");
+  const [isLoading, setIsLoading] = useState(false);
+  const [ollamaStatus, setOllamaStatus] = useState<boolean | null>(null);
+  const [selectedTone, setSelectedTone] = useState<EmailTone>("formal");
+  const [error, setError] = useState<string | null>(null);
+
+  const toneOptions: { value: EmailTone; label: string; prompt: string }[] = [
+    { value: "accept", label: "수락", prompt: "Write a polite acceptance email response" },
+    { value: "decline", label: "거절", prompt: "Write a polite but firm decline email response" },
+    { value: "inquiry", label: "문의", prompt: "Write a professional inquiry email response" },
+    { value: "formal", label: "정중", prompt: "Write a formal and professional email response" },
+    { value: "casual", label: "친근", prompt: "Write a friendly and casual email response" },
+  ];
+
+  useEffect(() => {
+    checkOllamaConnection();
+    setupGlobalShortcut();
+
+    return () => {
+      unregister("Alt+S").catch(console.error);
+    };
+  }, []);
+
+  async function checkOllamaConnection() {
+    try {
+      const status = await invoke<boolean>("check_ollama_status");
+      setOllamaStatus(status);
+    } catch {
+      setOllamaStatus(false);
+    }
+  }
+
+  async function setupGlobalShortcut() {
+    try {
+      await register("Alt+S", async () => {
+        const clipboardText = await readText();
+        if (clipboardText) {
+          setInputText(clipboardText);
+          await invoke("show_window");
+        }
+      });
+    } catch (err) {
+      console.error("Failed to register shortcut:", err);
+    }
+  }
+
+  async function generateResponse() {
+    if (!inputText.trim()) {
+      setError("이메일 내용을 입력해주세요.");
+      return;
+    }
+
+    setIsLoading(true);
+    setError(null);
+
+    const toneConfig = toneOptions.find((t) => t.value === selectedTone);
+    const prompt = toneConfig?.prompt + ".\n\nOriginal email:\n" + inputText + "\n\nResponse (in the same language as the original email):";
+
+    try {
+      const response = await invoke<string>("generate_ai_response", {
+        prompt,
+        model: null,
+      });
+      setGeneratedResponse(response);
+    } catch (err) {
+      setError("AI 응답 생성 실패: " + err);
+    } finally {
+      setIsLoading(false);
+    }
+  }
+
+  async function copyToClipboard() {
+    try {
+      await navigator.clipboard.writeText(generatedResponse);
+    } catch (err) {
+      console.error("Failed to copy:", err);
+    }
+  }
+
+  const statusClass = ollamaStatus ? "online" : "offline";
+  const statusText = ollamaStatus ? "AI 연결됨" : "AI 오프라인";
+
+  return (
+    <main className="app-container">
+      <header className="app-header">
+        <h1>Maily</h1>
+        <div className={"status-indicator " + statusClass}>
+          {statusText}
+        </div>
+      </header>
+
+      <section className="input-section">
+        <label htmlFor="email-input">원본 이메일</label>
+        <textarea
+          id="email-input"
+          value={inputText}
+          onChange={(e) => setInputText(e.target.value)}
+          placeholder="이메일 내용을 붙여넣거나 Alt+S로 클립보드에서 가져오세요..."
+          rows={6}
+        />
+      </section>
+
+      <section className="tone-section">
+        <label>응답 톤</label>
+        <div className="tone-buttons">
+          {toneOptions.map((tone) => (
+            <button
+              key={tone.value}
+              className={"tone-btn " + (selectedTone === tone.value ? "active" : "")}
+              onClick={() => setSelectedTone(tone.value)}
+            >
+              {tone.label}
+            </button>
+          ))}
+        </div>
+      </section>
+
+      <button
+        className="generate-btn"
+        onClick={generateResponse}
+        disabled={isLoading || !ollamaStatus}
+      >
+        {isLoading ? "생성 중..." : "답변 생성"}
+      </button>
+
+      {error && <div className="error-message">{error}</div>}
+
+      {generatedResponse && (
+        <section className="output-section">
+          <div className="output-header">
+            <label>생성된 답변</label>
+            <button className="copy-btn" onClick={copyToClipboard}>
+              복사
+            </button>
+          </div>
+          <div className="output-content">{generatedResponse}</div>
+        </section>
+      )}
+
+      <footer className="app-footer">
+        <small>Alt+S: 클립보드에서 텍스트 가져오기</small>
+      </footer>
+    </main>
+  );
+}
+
+export default App;
