@@ -22,3 +22,4 @@ Thumbs.db
 # Environment
 .env
 .env.local
+src-tauri/.env

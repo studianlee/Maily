@@ -6,6 +6,8 @@ use std::net::{TcpListener, SocketAddr};
 use std::time::Duration;
 use std::fs;
 use socket2::{Socket, Domain, Type};
+use rusqlite::{Connection, params};
+use chrono::Utc;
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
@@ -13,15 +15,36 @@ use tauri::{
 };
 use serde::{Deserialize, Serialize};
 
-// Google OAuth 설정
-const GOOGLE_CLIENT_ID: &str = "79670033194-hi21nfsubttv5nfbmjtmh7ovusq4eltk.apps.googleusercontent.com";
-const GOOGLE_CLIENT_SECRET: &str = "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";
+// Google OAuth 설정 (환경변수에서 로드)
 const GOOGLE_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const GOOGLE_REDIRECT_URI: &str = "http://localhost:8585/callback";
 const GMAIL_SCOPES: &str = "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/gmail.modify";
 
-// 토큰 저장용 상태
+// Microsoft OAuth 설정 (환경변수에서 로드)
+const MS_AUTH_URL: &str = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize";
+const MS_TOKEN_URL: &str = "https://login.microsoftonline.com/common/oauth2/v2.0/token";
+const MS_REDIRECT_URI: &str = "http://localhost:8586/callback";
+const MS_SCOPES: &str = "openid profile email offline_access Mail.Read Mail.Send Mail.ReadWrite";
+
+// 환경변수에서 OAuth 자격증명 로드
+fn get_google_client_id() -> String {
+    std::env::var("GOOGLE_CLIENT_ID").unwrap_or_default()
+}
+
+fn get_google_client_secret() -> String {
+    std::env::var("GOOGLE_CLIENT_SECRET").unwrap_or_default()
+}
+
+fn get_ms_client_id() -> String {
+    std::env::var("MS_CLIENT_ID").unwrap_or_default()
+}
+
+fn get_ms_client_secret() -> String {
+    std::env::var("MS_CLIENT_SECRET").unwrap_or_default()
+}
+
+// 토큰 저장용 상태 - Google
 pub struct GoogleAuthState {
     pub access_token: Mutex<Option<String>>,
     pub refresh_token: Mutex<Option<String>>,
@@ -34,6 +57,29 @@ impl Default for GoogleAuthState {
             refresh_token: Mutex::new(None),
         }
     }
+}
+
+// 토큰 저장용 상태 - Microsoft
+pub struct MicrosoftAuthState {
+    pub access_token: Mutex<Option<String>>,
+    pub refresh_token: Mutex<Option<String>>,
+}
+
+impl Default for MicrosoftAuthState {
+    fn default() -> Self {
+        Self {
+            access_token: Mutex::new(None),
+            refresh_token: Mutex::new(None),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MicrosoftTokenResponse {
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+    pub expires_in: i64,
+    pub token_type: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -112,6 +158,67 @@ struct GmailPart {
     #[serde(rename = "mimeType")]
     mime_type: String,
     body: GmailBody,
+}
+
+// Outlook 메시지 타입
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutlookMessage {
+    pub id: String,
+    #[serde(rename = "conversationId")]
+    pub conversation_id: Option<String>,
+    pub subject: Option<String>,
+    pub from: Option<OutlookEmailAddress>,
+    #[serde(rename = "receivedDateTime")]
+    pub received_date_time: Option<String>,
+    #[serde(rename = "bodyPreview")]
+    pub body_preview: Option<String>,
+    pub body: Option<OutlookBody>,
+    #[serde(rename = "isRead")]
+    pub is_read: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutlookEmailAddress {
+    #[serde(rename = "emailAddress")]
+    pub email_address: Option<OutlookEmail>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutlookEmail {
+    pub name: Option<String>,
+    pub address: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutlookBody {
+    #[serde(rename = "contentType")]
+    pub content_type: Option<String>,
+    pub content: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct OutlookListResponse {
+    value: Option<Vec<OutlookMessage>>,
+    #[serde(rename = "@odata.nextLink")]
+    next_link: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutlookMessagesResult {
+    pub messages: Vec<OutlookMessageSimple>,
+    pub next_link: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutlookMessageSimple {
+    pub id: String,
+    pub conversation_id: String,
+    pub subject: String,
+    pub from: String,
+    pub date: String,
+    pub snippet: String,
+    pub body: Option<String>,
+    pub is_unread: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -288,7 +395,7 @@ fn get_google_auth_url() -> String {
     format!(
         "{}?client_id={}&redirect_uri={}&response_type=code&scope={}&access_type=offline&prompt=consent",
         GOOGLE_AUTH_URL,
-        GOOGLE_CLIENT_ID,
+        &get_google_client_id(),
         urlencoding::encode(GOOGLE_REDIRECT_URI),
         urlencoding::encode(GMAIL_SCOPES)
     )
@@ -302,7 +409,7 @@ async fn start_google_auth(
     let auth_url = format!(
         "{}?client_id={}&redirect_uri={}&response_type=code&scope={}&access_type=offline&prompt=consent",
         GOOGLE_AUTH_URL,
-        GOOGLE_CLIENT_ID,
+        &get_google_client_id(),
         urlencoding::encode(GOOGLE_REDIRECT_URI),
         urlencoding::encode(GMAIL_SCOPES)
     );
@@ -364,9 +471,11 @@ async fn start_google_auth(
 
     // 토큰 교환
     let client = reqwest::Client::new();
+    let google_client_id = get_google_client_id();
+    let google_client_secret = get_google_client_secret();
     let params = [
-        ("client_id", GOOGLE_CLIENT_ID),
-        ("client_secret", GOOGLE_CLIENT_SECRET),
+        ("client_id", google_client_id.as_str()),
+        ("client_secret", google_client_secret.as_str()),
         ("code", code.as_str()),
         ("redirect_uri", GOOGLE_REDIRECT_URI),
         ("grant_type", "authorization_code"),
@@ -399,11 +508,13 @@ async fn exchange_google_code(
     state: State<'_, GoogleAuthState>,
 ) -> Result<String, String> {
     let client = reqwest::Client::new();
+    let google_client_id = get_google_client_id();
+    let google_client_secret = get_google_client_secret();
 
     let params = [
-        ("client_id", GOOGLE_CLIENT_ID),
-        ("client_secret", GOOGLE_CLIENT_SECRET),
-        ("code", &code),
+        ("client_id", google_client_id.as_str()),
+        ("client_secret", google_client_secret.as_str()),
+        ("code", code.as_str()),
         ("redirect_uri", GOOGLE_REDIRECT_URI),
         ("grant_type", "authorization_code"),
     ];
@@ -848,9 +959,11 @@ async fn refresh_gmail_token(
         .ok_or("리프레시 토큰이 없습니다. 다시 로그인해주세요.")?;
 
     let client = reqwest::Client::new();
+    let google_client_id = get_google_client_id();
+    let google_client_secret = get_google_client_secret();
     let params = [
-        ("client_id", GOOGLE_CLIENT_ID),
-        ("client_secret", GOOGLE_CLIENT_SECRET),
+        ("client_id", google_client_id.as_str()),
+        ("client_secret", google_client_secret.as_str()),
         ("refresh_token", refresh_token.as_str()),
         ("grant_type", "refresh_token"),
     ];
@@ -887,6 +1000,422 @@ async fn refresh_gmail_token(
         refresh_token: refresh,
     };
     if let Some(token_path) = get_token_path(&app) {
+        if let Some(parent) = token_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Ok(json) = serde_json::to_string(&tokens) {
+            let _ = fs::write(&token_path, json);
+        }
+    }
+
+    Ok(token_data.access_token)
+}
+
+// === Outlook 관련 함수 ===
+
+fn get_outlook_token_path(app: &tauri::AppHandle) -> Option<PathBuf> {
+    app.path().app_data_dir().ok().map(|dir| dir.join("outlook_tokens.json"))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SavedOutlookTokens {
+    access_token: String,
+    refresh_token: Option<String>,
+}
+
+#[tauri::command]
+async fn start_microsoft_auth(
+    state: State<'_, MicrosoftAuthState>,
+) -> Result<String, String> {
+    let auth_url = format!(
+        "{}?client_id={}&redirect_uri={}&response_type=code&scope={}&response_mode=query",
+        MS_AUTH_URL,
+        &get_ms_client_id(),
+        urlencoding::encode(MS_REDIRECT_URI),
+        urlencoding::encode(MS_SCOPES)
+    );
+
+    // 로컬 서버 시작 (포트 8586)
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, None)
+        .map_err(|e| format!("소켓 생성 실패: {}", e))?;
+    socket.set_reuse_address(true)
+        .map_err(|e| format!("SO_REUSEADDR 설정 실패: {}", e))?;
+    socket.set_read_timeout(Some(Duration::from_secs(120)))
+        .map_err(|e| format!("타임아웃 설정 실패: {}", e))?;
+    let addr: SocketAddr = "127.0.0.1:8586".parse().unwrap();
+    socket.bind(&addr.into())
+        .map_err(|e| format!("포트 바인딩 실패 (8586 포트가 사용 중일 수 있습니다): {}", e))?;
+    socket.listen(1)
+        .map_err(|e| format!("리슨 실패: {}", e))?;
+    let listener: TcpListener = socket.into();
+    listener.set_nonblocking(false).ok();
+
+    webbrowser::open(&auth_url)
+        .map_err(|e| format!("브라우저 열기 실패: {}", e))?;
+
+    let (mut stream, _) = listener.accept()
+        .map_err(|e| format!("인증 대기 시간 초과 또는 연결 실패: {}", e))?;
+
+    stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
+
+    let mut buffer = [0; 2048];
+    stream.read(&mut buffer)
+        .map_err(|e| format!("요청 읽기 실패: {}", e))?;
+
+    let request = String::from_utf8_lossy(&buffer);
+
+    let code = request
+        .lines()
+        .next()
+        .and_then(|line| {
+            line.split_whitespace()
+                .nth(1)
+                .and_then(|path| {
+                    path.split("code=")
+                        .nth(1)
+                        .map(|c| c.split('&').next().unwrap_or(c).to_string())
+                })
+        })
+        .ok_or("인증 코드를 찾을 수 없습니다")?;
+
+    let response = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<html><body><h1>인증 완료!</h1><p>이 창을 닫고 앱으로 돌아가세요.</p><script>window.close();</script></body></html>";
+    let _ = stream.write_all(response.as_bytes());
+
+    // 토큰 교환
+    let client = reqwest::Client::new();
+    let ms_client_id = get_ms_client_id();
+    let ms_client_secret = get_ms_client_secret();
+    let params = [
+        ("client_id", ms_client_id.as_str()),
+        ("client_secret", ms_client_secret.as_str()),
+        ("code", code.as_str()),
+        ("redirect_uri", MS_REDIRECT_URI),
+        ("grant_type", "authorization_code"),
+    ];
+
+    let token_response = client
+        .post(MS_TOKEN_URL)
+        .form(&params)
+        .send()
+        .await
+        .map_err(|e| format!("토큰 교환 실패: {}", e))?;
+
+    let token_data: MicrosoftTokenResponse = token_response
+        .json()
+        .await
+        .map_err(|e| format!("토큰 파싱 실패: {}", e))?;
+
+    *state.access_token.lock().unwrap() = Some(token_data.access_token.clone());
+    if let Some(ref refresh) = token_data.refresh_token {
+        *state.refresh_token.lock().unwrap() = Some(refresh.clone());
+    }
+
+    Ok(token_data.access_token)
+}
+
+#[tauri::command]
+async fn get_outlook_messages(
+    state: State<'_, MicrosoftAuthState>,
+    max_results: Option<u32>,
+    search_query: Option<String>,
+    skip: Option<u32>,
+) -> Result<OutlookMessagesResult, String> {
+    let access_token = state.access_token.lock().unwrap().clone()
+        .ok_or("Outlook 로그인이 필요합니다")?;
+
+    let client = reqwest::Client::new();
+    let max = max_results.unwrap_or(20);
+
+    let mut url = format!(
+        "https://graph.microsoft.com/v1.0/me/messages?$top={}&$orderby=receivedDateTime desc&$select=id,conversationId,subject,from,receivedDateTime,bodyPreview,isRead",
+        max
+    );
+
+    if let Some(query) = &search_query {
+        if !query.trim().is_empty() {
+            url.push_str(&format!("&$search=\"{}\"", urlencoding::encode(query.trim())));
+        }
+    }
+
+    if let Some(s) = skip {
+        url.push_str(&format!("&$skip={}", s));
+    }
+
+    let response: OutlookListResponse = client
+        .get(&url)
+        .bearer_auth(&access_token)
+        .send()
+        .await
+        .map_err(|e| format!("메일 목록 조회 실패: {}", e))?
+        .json()
+        .await
+        .map_err(|e| format!("메일 목록 파싱 실패: {}", e))?;
+
+    let messages: Vec<OutlookMessageSimple> = response.value.unwrap_or_default()
+        .into_iter()
+        .map(|m| {
+            let from = m.from
+                .and_then(|f| f.email_address)
+                .map(|e| {
+                    let name = e.name.unwrap_or_default();
+                    let addr = e.address.unwrap_or_default();
+                    if name.is_empty() { addr } else { format!("{} <{}>", name, addr) }
+                })
+                .unwrap_or_default();
+
+            OutlookMessageSimple {
+                id: m.id,
+                conversation_id: m.conversation_id.unwrap_or_default(),
+                subject: m.subject.unwrap_or_default(),
+                from,
+                date: m.received_date_time.unwrap_or_default(),
+                snippet: m.body_preview.unwrap_or_default(),
+                body: None,
+                is_unread: !m.is_read.unwrap_or(true),
+            }
+        })
+        .collect();
+
+    Ok(OutlookMessagesResult {
+        messages,
+        next_link: response.next_link,
+    })
+}
+
+#[tauri::command]
+async fn get_outlook_message_detail(
+    state: State<'_, MicrosoftAuthState>,
+    message_id: String,
+) -> Result<OutlookMessageSimple, String> {
+    let access_token = state.access_token.lock().unwrap().clone()
+        .ok_or("Outlook 로그인이 필요합니다")?;
+
+    let client = reqwest::Client::new();
+    let url = format!(
+        "https://graph.microsoft.com/v1.0/me/messages/{}?$select=id,conversationId,subject,from,receivedDateTime,bodyPreview,body,isRead",
+        message_id
+    );
+
+    let m: OutlookMessage = client
+        .get(&url)
+        .bearer_auth(&access_token)
+        .send()
+        .await
+        .map_err(|e| format!("메일 조회 실패: {}", e))?
+        .json()
+        .await
+        .map_err(|e| format!("메일 파싱 실패: {}", e))?;
+
+    let from = m.from
+        .and_then(|f| f.email_address)
+        .map(|e| {
+            let name = e.name.unwrap_or_default();
+            let addr = e.address.unwrap_or_default();
+            if name.is_empty() { addr } else { format!("{} <{}>", name, addr) }
+        })
+        .unwrap_or_default();
+
+    let body = m.body.and_then(|b| b.content);
+
+    Ok(OutlookMessageSimple {
+        id: m.id,
+        conversation_id: m.conversation_id.unwrap_or_default(),
+        subject: m.subject.unwrap_or_default(),
+        from,
+        date: m.received_date_time.unwrap_or_default(),
+        snippet: m.body_preview.unwrap_or_default(),
+        body,
+        is_unread: !m.is_read.unwrap_or(true),
+    })
+}
+
+#[tauri::command]
+async fn send_outlook(
+    state: State<'_, MicrosoftAuthState>,
+    to: String,
+    subject: String,
+    body: String,
+) -> Result<String, String> {
+    let access_token = state.access_token.lock().unwrap().clone()
+        .ok_or("Outlook 로그인이 필요합니다")?;
+
+    let client = reqwest::Client::new();
+
+    let email_body = serde_json::json!({
+        "message": {
+            "subject": subject,
+            "body": {
+                "contentType": "Text",
+                "content": body
+            },
+            "toRecipients": [
+                {
+                    "emailAddress": {
+                        "address": to
+                    }
+                }
+            ]
+        },
+        "saveToSentItems": "true"
+    });
+
+    let response = client
+        .post("https://graph.microsoft.com/v1.0/me/sendMail")
+        .bearer_auth(&access_token)
+        .json(&email_body)
+        .send()
+        .await
+        .map_err(|e| format!("메일 전송 실패: {}", e))?;
+
+    if response.status().is_success() {
+        Ok("메일이 전송되었습니다".to_string())
+    } else {
+        let error_text = response.text().await.unwrap_or_default();
+        Err(format!("메일 전송 실패: {}", error_text))
+    }
+}
+
+#[tauri::command]
+async fn mark_outlook_as_read(
+    state: State<'_, MicrosoftAuthState>,
+    message_id: String,
+) -> Result<(), String> {
+    let access_token = state.access_token.lock().unwrap().clone()
+        .ok_or("Outlook 로그인이 필요합니다")?;
+
+    let client = reqwest::Client::new();
+    let url = format!(
+        "https://graph.microsoft.com/v1.0/me/messages/{}",
+        message_id
+    );
+
+    let body = serde_json::json!({
+        "isRead": true
+    });
+
+    let response = client
+        .patch(&url)
+        .bearer_auth(&access_token)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("읽음 처리 실패: {}", e))?;
+
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        let error_text = response.text().await.unwrap_or_default();
+        Err(format!("읽음 처리 실패: {}", error_text))
+    }
+}
+
+#[tauri::command]
+fn is_outlook_authenticated(state: State<'_, MicrosoftAuthState>) -> bool {
+    state.access_token.lock().unwrap().is_some()
+}
+
+#[tauri::command]
+fn logout_outlook(state: State<'_, MicrosoftAuthState>, app: tauri::AppHandle) {
+    *state.access_token.lock().unwrap() = None;
+    *state.refresh_token.lock().unwrap() = None;
+    if let Some(token_path) = get_outlook_token_path(&app) {
+        let _ = fs::remove_file(token_path);
+    }
+}
+
+#[tauri::command]
+fn save_outlook_tokens(
+    state: State<'_, MicrosoftAuthState>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    let access_token = state.access_token.lock().unwrap().clone();
+    let refresh_token = state.refresh_token.lock().unwrap().clone();
+
+    if let Some(access) = access_token {
+        let tokens = SavedOutlookTokens {
+            access_token: access,
+            refresh_token,
+        };
+
+        if let Some(token_path) = get_outlook_token_path(&app) {
+            if let Some(parent) = token_path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let json = serde_json::to_string(&tokens).map_err(|e| e.to_string())?;
+            fs::write(&token_path, json).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn load_outlook_tokens(
+    state: State<'_, MicrosoftAuthState>,
+    app: tauri::AppHandle,
+) -> Result<bool, String> {
+    if let Some(token_path) = get_outlook_token_path(&app) {
+        if token_path.exists() {
+            let json = fs::read_to_string(&token_path).map_err(|e| e.to_string())?;
+            let tokens: SavedOutlookTokens = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+
+            *state.access_token.lock().unwrap() = Some(tokens.access_token);
+            *state.refresh_token.lock().unwrap() = tokens.refresh_token;
+
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[tauri::command]
+async fn refresh_outlook_token(
+    state: State<'_, MicrosoftAuthState>,
+    app: tauri::AppHandle,
+) -> Result<String, String> {
+    let refresh_token = state.refresh_token.lock().unwrap().clone()
+        .ok_or("리프레시 토큰이 없습니다. 다시 로그인해주세요.")?;
+
+    let client = reqwest::Client::new();
+    let ms_client_id = get_ms_client_id();
+    let ms_client_secret = get_ms_client_secret();
+    let params = [
+        ("client_id", ms_client_id.as_str()),
+        ("client_secret", ms_client_secret.as_str()),
+        ("refresh_token", refresh_token.as_str()),
+        ("grant_type", "refresh_token"),
+        ("scope", MS_SCOPES),
+    ];
+
+    let response = client
+        .post(MS_TOKEN_URL)
+        .form(&params)
+        .send()
+        .await
+        .map_err(|e| format!("토큰 갱신 요청 실패: {}", e))?;
+
+    if !response.status().is_success() {
+        let error_text = response.text().await.unwrap_or_default();
+        return Err(format!("토큰 갱신 실패: {}. 다시 로그인해주세요.", error_text));
+    }
+
+    let token_data: MicrosoftTokenResponse = response
+        .json()
+        .await
+        .map_err(|e| format!("토큰 파싱 실패: {}", e))?;
+
+    *state.access_token.lock().unwrap() = Some(token_data.access_token.clone());
+    if let Some(ref new_refresh) = token_data.refresh_token {
+        *state.refresh_token.lock().unwrap() = Some(new_refresh.clone());
+    }
+
+    // 파일에도 저장
+    let access = token_data.access_token.clone();
+    let refresh = state.refresh_token.lock().unwrap().clone();
+    let tokens = SavedOutlookTokens {
+        access_token: access.clone(),
+        refresh_token: refresh,
+    };
+    if let Some(token_path) = get_outlook_token_path(&app) {
         if let Some(parent) = token_path.parent() {
             let _ = fs::create_dir_all(parent);
         }
@@ -994,9 +1523,303 @@ fn get_app_info(app_handle: tauri::AppHandle) -> Result<serde_json::Value, Strin
         "data_dir": data_dir.to_string_lossy(),
     }))
 }
+
+// === 예약 이메일 관련 ===
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduledEmail {
+    pub id: i64,
+    pub provider: String,        // "gmail" or "outlook"
+    pub to: String,
+    pub subject: String,
+    pub body: String,
+    pub scheduled_at: String,    // ISO 8601 format
+    pub status: String,          // "pending", "sent", "failed"
+    pub created_at: String,
+    pub error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateScheduledEmail {
+    pub provider: String,
+    pub to: String,
+    pub subject: String,
+    pub body: String,
+    pub scheduled_at: String,
+}
+
+fn get_scheduled_db_path(app: &tauri::AppHandle) -> Option<PathBuf> {
+    app.path().app_data_dir().ok().map(|dir| dir.join("scheduled_emails.db"))
+}
+
+fn init_scheduled_db(app: &tauri::AppHandle) -> Result<Connection, String> {
+    let db_path = get_scheduled_db_path(app)
+        .ok_or("데이터 디렉토리를 찾을 수 없습니다")?;
+
+    if let Some(parent) = db_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    let conn = Connection::open(&db_path)
+        .map_err(|e| format!("데이터베이스 열기 실패: {}", e))?;
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS scheduled_emails (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            provider TEXT NOT NULL,
+            to_addr TEXT NOT NULL,
+            subject TEXT NOT NULL,
+            body TEXT NOT NULL,
+            scheduled_at TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at TEXT NOT NULL,
+            error_message TEXT
+        )",
+        [],
+    ).map_err(|e| format!("테이블 생성 실패: {}", e))?;
+
+    Ok(conn)
+}
+
+#[tauri::command]
+fn create_scheduled_email(
+    app: tauri::AppHandle,
+    email: CreateScheduledEmail,
+) -> Result<ScheduledEmail, String> {
+    let conn = init_scheduled_db(&app)?;
+    let now = Utc::now().to_rfc3339();
+
+    conn.execute(
+        "INSERT INTO scheduled_emails (provider, to_addr, subject, body, scheduled_at, status, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6)",
+        params![email.provider, email.to, email.subject, email.body, email.scheduled_at, now],
+    ).map_err(|e| format!("예약 저장 실패: {}", e))?;
+
+    let id = conn.last_insert_rowid();
+
+    Ok(ScheduledEmail {
+        id,
+        provider: email.provider,
+        to: email.to,
+        subject: email.subject,
+        body: email.body,
+        scheduled_at: email.scheduled_at,
+        status: "pending".to_string(),
+        created_at: now,
+        error_message: None,
+    })
+}
+
+#[tauri::command]
+fn get_scheduled_emails(app: tauri::AppHandle) -> Result<Vec<ScheduledEmail>, String> {
+    let conn = init_scheduled_db(&app)?;
+
+    let mut stmt = conn.prepare(
+        "SELECT id, provider, to_addr, subject, body, scheduled_at, status, created_at, error_message
+         FROM scheduled_emails ORDER BY scheduled_at ASC"
+    ).map_err(|e| format!("쿼리 준비 실패: {}", e))?;
+
+    let emails = stmt.query_map([], |row| {
+        Ok(ScheduledEmail {
+            id: row.get(0)?,
+            provider: row.get(1)?,
+            to: row.get(2)?,
+            subject: row.get(3)?,
+            body: row.get(4)?,
+            scheduled_at: row.get(5)?,
+            status: row.get(6)?,
+            created_at: row.get(7)?,
+            error_message: row.get(8)?,
+        })
+    }).map_err(|e| format!("쿼리 실행 실패: {}", e))?;
+
+    let result: Vec<ScheduledEmail> = emails
+        .filter_map(|e| e.ok())
+        .collect();
+
+    Ok(result)
+}
+
+#[tauri::command]
+fn delete_scheduled_email(app: tauri::AppHandle, id: i64) -> Result<(), String> {
+    let conn = init_scheduled_db(&app)?;
+
+    conn.execute(
+        "DELETE FROM scheduled_emails WHERE id = ?1",
+        params![id],
+    ).map_err(|e| format!("삭제 실패: {}", e))?;
+
+    Ok(())
+}
+
+#[tauri::command]
+fn update_scheduled_email(
+    app: tauri::AppHandle,
+    id: i64,
+    email: CreateScheduledEmail,
+) -> Result<(), String> {
+    let conn = init_scheduled_db(&app)?;
+
+    conn.execute(
+        "UPDATE scheduled_emails SET provider = ?1, to_addr = ?2, subject = ?3, body = ?4, scheduled_at = ?5
+         WHERE id = ?6 AND status = 'pending'",
+        params![email.provider, email.to, email.subject, email.body, email.scheduled_at, id],
+    ).map_err(|e| format!("업데이트 실패: {}", e))?;
+
+    Ok(())
+}
+
+// 예약된 이메일 발송 체크 (프론트엔드에서 주기적으로 호출)
+#[tauri::command]
+async fn check_and_send_scheduled_emails(
+    app: tauri::AppHandle,
+    google_state: State<'_, GoogleAuthState>,
+    ms_state: State<'_, MicrosoftAuthState>,
+) -> Result<Vec<i64>, String> {
+    // 데이터베이스 작업을 별도 블록으로 분리 (Send 트레잇 문제 해결)
+    let pending: Vec<(i64, String, String, String, String)> = {
+        let conn = init_scheduled_db(&app)?;
+        let now = Utc::now().to_rfc3339();
+
+        let mut stmt = conn.prepare(
+            "SELECT id, provider, to_addr, subject, body FROM scheduled_emails
+             WHERE status = 'pending' AND scheduled_at <= ?1"
+        ).map_err(|e| format!("쿼리 준비 실패: {}", e))?;
+
+        let rows = stmt.query_map(params![now], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+        }).map_err(|e| format!("쿼리 실행 실패: {}", e))?;
+
+        let result: Vec<_> = rows.filter_map(|e| e.ok()).collect();
+        result
+    };
+
+    let mut sent_ids = Vec::new();
+
+    for (id, provider, to, subject, body) in pending {
+        let result = if provider == "gmail" {
+            send_gmail_internal(&google_state, &to, &subject, &body).await
+        } else {
+            send_outlook_internal(&ms_state, &to, &subject, &body).await
+        };
+
+        // 결과 업데이트도 별도 블록
+        {
+            let conn = init_scheduled_db(&app)?;
+            match &result {
+                Ok(_) => {
+                    conn.execute(
+                        "UPDATE scheduled_emails SET status = 'sent' WHERE id = ?1",
+                        params![id],
+                    ).ok();
+                    sent_ids.push(id);
+                }
+                Err(e) => {
+                    conn.execute(
+                        "UPDATE scheduled_emails SET status = 'failed', error_message = ?1 WHERE id = ?2",
+                        params![e.clone(), id],
+                    ).ok();
+                }
+            }
+        }
+    }
+
+    Ok(sent_ids)
+}
+
+// Gmail 내부 발송 함수
+async fn send_gmail_internal(
+    state: &State<'_, GoogleAuthState>,
+    to: &str,
+    subject: &str,
+    body: &str,
+) -> Result<String, String> {
+    let access_token = state.access_token.lock().unwrap().clone()
+        .ok_or("Gmail 로그인이 필요합니다")?;
+
+    let client = reqwest::Client::new();
+
+    let email = format!(
+        "To: {}\r\nSubject: {}\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{}",
+        to, subject, body
+    );
+
+    use base64::{Engine as _, engine::general_purpose};
+    let encoded = general_purpose::URL_SAFE_NO_PAD.encode(email.as_bytes());
+
+    let send_body = serde_json::json!({
+        "raw": encoded
+    });
+
+    let response = client
+        .post("https://gmail.googleapis.com/gmail/v1/users/me/messages/send")
+        .bearer_auth(&access_token)
+        .json(&send_body)
+        .send()
+        .await
+        .map_err(|e| format!("메일 전송 실패: {}", e))?;
+
+    if response.status().is_success() {
+        Ok("메일이 전송되었습니다".to_string())
+    } else {
+        let error_text = response.text().await.unwrap_or_default();
+        Err(format!("메일 전송 실패: {}", error_text))
+    }
+}
+
+// Outlook 내부 발송 함수
+async fn send_outlook_internal(
+    state: &State<'_, MicrosoftAuthState>,
+    to: &str,
+    subject: &str,
+    body: &str,
+) -> Result<String, String> {
+    let access_token = state.access_token.lock().unwrap().clone()
+        .ok_or("Outlook 로그인이 필요합니다")?;
+
+    let client = reqwest::Client::new();
+
+    let email_body = serde_json::json!({
+        "message": {
+            "subject": subject,
+            "body": {
+                "contentType": "Text",
+                "content": body
+            },
+            "toRecipients": [
+                {
+                    "emailAddress": {
+                        "address": to
+                    }
+                }
+            ]
+        },
+        "saveToSentItems": "true"
+    });
+
+    let response = client
+        .post("https://graph.microsoft.com/v1.0/me/sendMail")
+        .bearer_auth(&access_token)
+        .json(&email_body)
+        .send()
+        .await
+        .map_err(|e| format!("메일 전송 실패: {}", e))?;
+
+    if response.status().is_success() {
+        Ok("메일이 전송되었습니다".to_string())
+    } else {
+        let error_text = response.text().await.unwrap_or_default();
+        Err(format!("메일 전송 실패: {}", error_text))
+    }
+}
+
 pub fn run() {
+    // .env 파일에서 환경변수 로드 (개발 환경)
+    let _ = dotenvy::dotenv();
+
     tauri::Builder::default()
         .manage(GoogleAuthState::default())
+        .manage(MicrosoftAuthState::default())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
@@ -1081,7 +1904,24 @@ pub fn run() {
             // 이메일 캐시
             save_email_cache,
             load_email_cache,
-            clear_email_cache
+            clear_email_cache,
+            // Outlook 관련
+            start_microsoft_auth,
+            get_outlook_messages,
+            get_outlook_message_detail,
+            send_outlook,
+            mark_outlook_as_read,
+            is_outlook_authenticated,
+            logout_outlook,
+            save_outlook_tokens,
+            load_outlook_tokens,
+            refresh_outlook_token,
+            // 예약 이메일 관련
+            create_scheduled_email,
+            get_scheduled_emails,
+            delete_scheduled_email,
+            update_scheduled_email,
+            check_and_send_scheduled_emails
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

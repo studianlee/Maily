@@ -30,3 +30,6 @@ urlencoding = "2"
 socket2 = "0.5"
 webbrowser = "1"
 futures-util = "0.3"
+dotenvy = "0.15"
+chrono = { version = "0.4", features = ["serde"] }
+rusqlite = { version = "0.31", features = ["bundled"] }

@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { Toast as ToastType } from "../types";
 import type { ViewState, EmailTone } from "../constants";
@@ -18,6 +19,7 @@ interface NewEmailProps {
   animating: boolean;
   closing: boolean;
   toast: ToastType | null;
+  emailProvider: string | null;
   onToChange: (to: string) => void;
   onSubjectChange: (subject: string) => void;
   onInputChange: (text: string) => void;
@@ -26,6 +28,7 @@ interface NewEmailProps {
   onGenerate: () => void;
   onCopy: () => void;
   onSend: () => void;
+  onSchedule: (scheduledAt: string) => void;
   onNavigate: (target: ViewState) => void;
   onKeyDown: (e: React.KeyboardEvent) => void;
 }
@@ -44,6 +47,7 @@ export function NewEmail({
   animating,
   closing,
   toast,
+  emailProvider,
   onToChange,
   onSubjectChange,
   onInputChange,
@@ -52,14 +56,33 @@ export function NewEmail({
   onGenerate,
   onCopy,
   onSend,
+  onSchedule,
   onNavigate,
   onKeyDown,
 }: NewEmailProps) {
+  const [showSchedule, setShowSchedule] = useState(false);
+  const [scheduleDate, setScheduleDate] = useState("");
+  const [scheduleTime, setScheduleTime] = useState("");
+
   function handleHeaderDrag(e: React.MouseEvent) {
     if (e.button === 0) {
       getCurrentWindow().startDragging();
     }
   }
+
+  function handleSchedule() {
+    if (!scheduleDate || !scheduleTime) return;
+    const scheduledAt = new Date(`${scheduleDate}T${scheduleTime}`).toISOString();
+    onSchedule(scheduledAt);
+    setShowSchedule(false);
+    setScheduleDate("");
+    setScheduleTime("");
+  }
+
+  // 최소 예약 시간: 현재 시간 + 5분
+  const now = new Date();
+  const minDate = now.toISOString().split("T")[0];
+  const minTime = now.toTimeString().slice(0, 5);
 
   return (
     <div
@@ -192,7 +215,41 @@ export function NewEmail({
                   </>
                 )}
               </button>
+              <button
+                className="schedule-btn"
+                onClick={() => setShowSchedule(!showSchedule)}
+                disabled={isSending || !outputText.trim() || !to.trim() || !subject.trim() || !emailProvider}
+              >
+                <span>🕐</span>
+                예약 발송
+              </button>
             </div>
+
+            {showSchedule && (
+              <div className="schedule-picker">
+                <div className="schedule-inputs">
+                  <input
+                    type="date"
+                    value={scheduleDate}
+                    onChange={(e) => setScheduleDate(e.target.value)}
+                    min={minDate}
+                  />
+                  <input
+                    type="time"
+                    value={scheduleTime}
+                    onChange={(e) => setScheduleTime(e.target.value)}
+                    min={scheduleDate === minDate ? minTime : undefined}
+                  />
+                </div>
+                <button
+                  className="schedule-confirm-btn"
+                  onClick={handleSchedule}
+                  disabled={!scheduleDate || !scheduleTime}
+                >
+                  예약 확정
+                </button>
+              </div>
+            )}
           </div>
         )}
       </div>

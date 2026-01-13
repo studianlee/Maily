@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import type { GmailMessage } from "../../types";
+import type { GmailMessage, EmailProvider } from "../../types";
 import type { Toast as ToastType } from "../../types";
 import type { ViewState } from "../../constants";
 import { Toast } from "../Toast";
@@ -12,13 +12,15 @@ interface InboxProps {
   emails: GmailMessage[];
   loading: boolean;
   error: string | null;
-  nextPageToken: string | null;
+  hasMore: boolean;
   loadingMore: boolean;
   animating: boolean;
   closing: boolean;
   toast: ToastType | null;
+  emailProvider: EmailProvider | null;
   onNavigate: (target: ViewState) => void;
-  onLogin: () => void;
+  onGmailLogin: () => void;
+  onOutlookLogin: () => void;
   onLogout: () => void;
   onLoadEmails: (query?: string) => void;
   onLoadMore: (query?: string) => void;
@@ -32,13 +34,15 @@ export function Inbox({
   emails,
   loading,
   error,
-  nextPageToken,
+  hasMore,
   loadingMore,
   animating,
   closing,
   toast,
+  emailProvider,
   onNavigate,
-  onLogin,
+  onGmailLogin,
+  onOutlookLogin,
   onLogout,
   onLoadEmails,
   onLoadMore,
@@ -74,7 +78,7 @@ export function Inbox({
   function handleScroll(e: React.UIEvent<HTMLDivElement>) {
     const target = e.currentTarget;
     const scrollBottom = target.scrollHeight - target.scrollTop - target.clientHeight;
-    if (scrollBottom < 100 && nextPageToken && !loadingMore) {
+    if (scrollBottom < 100 && hasMore && !loadingMore) {
       onLoadMore(isSearching ? searchQuery : undefined);
     }
   }
@@ -138,10 +142,10 @@ export function Inbox({
         {!authenticated ? (
           <div className="gmail-login-section">
             <div className="gmail-login-icon">📧</div>
-            <h3>Gmail 연결</h3>
+            <h3>이메일 연결</h3>
             {loading ? (
               <>
-                <p>브라우저에서 Google 로그인을 완료해주세요.</p>
+                <p>브라우저에서 로그인을 완료해주세요.</p>
                 <div className="login-waiting">
                   <span className="loading-spinner" />
                   <span>인증 대기 중...</span>
@@ -152,11 +156,17 @@ export function Inbox({
               </>
             ) : (
               <>
-                <p>Google 계정으로 로그인하여 이메일을 확인하세요.</p>
-                <button className="gmail-login-btn" onClick={onLogin}>
-                  <span>🔗</span>
-                  Google 계정 연결
-                </button>
+                <p>계정으로 로그인하여 이메일을 확인하세요.</p>
+                <div className="email-provider-buttons">
+                  <button className="gmail-login-btn" onClick={onGmailLogin}>
+                    <span>🔴</span>
+                    Gmail 연결
+                  </button>
+                  <button className="outlook-login-btn" onClick={onOutlookLogin}>
+                    <span>🔵</span>
+                    Outlook 연결
+                  </button>
+                </div>
               </>
             )}
             {error && (
@@ -217,7 +227,7 @@ export function Inbox({
                     <span>더 불러오는 중...</span>
                   </div>
                 )}
-                {!loadingMore && nextPageToken && (
+                {!loadingMore && hasMore && (
                   <button
                     className="load-more-btn"
                     onClick={() => onLoadMore(isSearching ? searchQuery : undefined)}
@@ -228,6 +238,9 @@ export function Inbox({
               </div>
             )}
             <div className="inbox-footer">
+              <span className="provider-badge">
+                {emailProvider === "outlook" ? "🔵 Outlook" : "🔴 Gmail"}
+              </span>
               <button className="logout-btn" onClick={onLogout}>
                 로그아웃
               </button>

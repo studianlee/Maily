@@ -2,17 +2,22 @@ import { useState, useEffect, useCallback } from "react";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import "./App.css";
 
-import type { GmailMessage } from "./types";
+import type { GmailMessage, EmailProvider } from "./types";
 import type { FeatureType, ViewState, EmailTone } from "./constants";
-import { useToast, useGmail, useAI, useWindowManager, useNavigation } from "./hooks";
+import { useToast, useGmail, useOutlook, useAI, useWindowManager, useNavigation, useScheduledEmail } from "./hooks";
 import { Logo, Menu, Inbox, Feature, NewEmail } from "./components";
 
 function App() {
   // Hooks
   const { toast, showToast } = useToast();
   const gmail = useGmail();
+  const outlook = useOutlook();
   const ai = useAI();
   const windowManager = useWindowManager();
+  const scheduledEmail = useScheduledEmail();
+
+  // 이메일 제공자 상태
+  const [emailProvider, setEmailProvider] = useState<EmailProvider | null>(null);
 
   // 네비게이션 관련 상태
   const [inputText, setInputText] = useState("");
@@ -48,56 +53,80 @@ function App() {
       ai.clearOutput();
     }
 
-    if (target === "inbox" && gmail.authenticated && gmail.emails.length === 0) {
-      gmail.loadEmails();
+    if (target === "inbox" && activeEmail.authenticated && activeEmail.emails.length === 0) {
+      activeEmail.loadEmails();
     }
   }, [navigation, windowManager.adjustWindow, ai, gmail]);
 
   // 초기화
   useEffect(() => {
     ai.checkStatus();
-    gmail.checkAuth();
+    // Gmail, Outlook 인증 상태 확인
+    gmail.checkAuth().then((isAuth) => {
+      if (isAuth) setEmailProvider("gmail");
+    });
+    outlook.checkAuth().then((isAuth) => {
+      if (isAuth && !emailProvider) setEmailProvider("outlook");
+    });
     navigation.setupShortcut();
     return () => {
       navigation.cleanupShortcut();
     };
   }, []);
 
+  // 현재 활성화된 이메일 훅
+  const activeEmail = emailProvider === "outlook" ? outlook : gmail;
+
   // Gmail 로그인
   async function handleGmailLogin() {
     const success = await gmail.login();
     if (success) {
+      setEmailProvider("gmail");
       await gmail.loadEmails();
+    }
+  }
+
+  // Outlook 로그인
+  async function handleOutlookLogin() {
+    const success = await outlook.login();
+    if (success) {
+      setEmailProvider("outlook");
+      await outlook.loadEmails();
     }
   }
 
   // 이메일 선택
   async function selectEmail(email: GmailMessage) {
     try {
-      const detail = await gmail.getMessageDetail(email.id);
+      const detail = await activeEmail.getMessageDetail(email.id);
       setInputText(detail.body || detail.snippet);
-      setReplyTo(detail);
+      setReplyTo(detail as GmailMessage);
       ai.clearOutput();
 
       if (email.is_unread) {
-        await gmail.markAsRead(email.id);
+        await activeEmail.markAsRead(email.id);
       }
 
       handleGoTo("email-reply");
     } catch (e) {
-      gmail.setError("메일 상세 로딩 실패: " + e);
+      activeEmail.setError("메일 상세 로딩 실패: " + e);
     }
   }
 
   // 로그아웃
-  async function handleGmailLogout() {
-    await gmail.logout();
+  async function handleLogout() {
+    if (emailProvider === "outlook") {
+      await outlook.logout();
+    } else {
+      await gmail.logout();
+    }
+    setEmailProvider(null);
     setReplyTo(null);
   }
 
   // 로그인 취소
   function handleCancelLogin() {
-    gmail.setError("로그인이 취소되었습니다.");
+    activeEmail.setError("로그인이 취소되었습니다.");
   }
 
   // 이메일 주소 추출
@@ -119,7 +148,7 @@ function App() {
         ? replyTo.subject
         : `Re: ${replyTo.subject}`;
 
-      await gmail.sendEmail(to, subject, ai.output);
+      await activeEmail.sendEmail(to, subject, ai.output);
 
       ai.clearOutput();
       setInputText("");
@@ -143,7 +172,7 @@ function App() {
       setIsSending(true);
       ai.setError(null);
 
-      await gmail.sendEmail(newEmailTo.trim(), newEmailSubject.trim(), ai.output);
+      await activeEmail.sendEmail(newEmailTo.trim(), newEmailSubject.trim(), ai.output);
 
       ai.clearOutput();
       setInputText("");
@@ -155,6 +184,37 @@ function App() {
     } catch (e) {
       showToast("메일 전송 실패", "error");
       ai.setError("메일 전송 실패: " + String(e));
+    } finally {
+      setIsSending(false);
+    }
+  }
+
+  // 이메일 예약 발송
+  async function scheduleNewEmail(scheduledAt: string) {
+    if (!newEmailTo.trim() || !newEmailSubject.trim() || !ai.output.trim() || !emailProvider) return;
+
+    try {
+      setIsSending(true);
+      ai.setError(null);
+
+      await scheduledEmail.createScheduled({
+        provider: emailProvider,
+        to: newEmailTo.trim(),
+        subject: newEmailSubject.trim(),
+        body: ai.output,
+        scheduled_at: scheduledAt,
+      });
+
+      ai.clearOutput();
+      setInputText("");
+      setNewEmailTo("");
+      setNewEmailSubject("");
+      setCopied(false);
+      showToast("메일이 예약되었습니다", "success");
+      handleGoTo("menu");
+    } catch (e) {
+      showToast("예약 실패", "error");
+      ai.setError("예약 실패: " + String(e));
     } finally {
       setIsSending(false);
     }
@@ -233,20 +293,22 @@ function App() {
   if (view === "inbox") {
     return (
       <Inbox
-        authenticated={gmail.authenticated}
-        emails={gmail.emails}
-        loading={gmail.loading}
-        error={gmail.error}
-        nextPageToken={gmail.nextPageToken}
-        loadingMore={gmail.loadingMore}
+        authenticated={activeEmail.authenticated}
+        emails={activeEmail.emails as GmailMessage[]}
+        loading={activeEmail.loading}
+        error={activeEmail.error}
+        hasMore={emailProvider === "outlook" ? !!outlook.nextLink : !!gmail.nextPageToken}
+        loadingMore={activeEmail.loadingMore}
         animating={animating}
         closing={closing}
         toast={toast}
+        emailProvider={emailProvider}
         onNavigate={handleGoTo}
-        onLogin={handleGmailLogin}
-        onLogout={handleGmailLogout}
-        onLoadEmails={gmail.loadEmails}
-        onLoadMore={gmail.loadMore}
+        onGmailLogin={handleGmailLogin}
+        onOutlookLogin={handleOutlookLogin}
+        onLogout={handleLogout}
+        onLoadEmails={activeEmail.loadEmails}
+        onLoadMore={activeEmail.loadMore}
         onSelectEmail={selectEmail}
         onCancelLogin={handleCancelLogin}
         onKeyDown={handleKeyDown}
@@ -271,6 +333,7 @@ function App() {
         animating={animating}
         closing={closing}
         toast={toast}
+        emailProvider={emailProvider}
         onToChange={setNewEmailTo}
         onSubjectChange={setNewEmailSubject}
         onInputChange={setInputText}
@@ -279,6 +342,7 @@ function App() {
         onGenerate={() => generateResponse("email-reply")}
         onCopy={copyToClipboard}
         onSend={sendNewEmail}
+        onSchedule={scheduleNewEmail}
         onNavigate={handleGoTo}
         onKeyDown={handleKeyDown}
       />
