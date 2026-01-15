@@ -1,13 +1,12 @@
+import { useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import type { GmailMessage } from "../types";
-import type { Toast as ToastType } from "../types";
-import type { FeatureType, ViewState } from "../constants";
-import { FEATURES, TONE_OPTIONS } from "../constants";
-import type { EmailTone } from "../constants";
+import type { GmailMessage, ToastNotification } from "../types";
+import type { ViewState, EmailTone } from "../constants";
+import { TONE_OPTIONS } from "../constants";
 import { Toast } from "./Toast";
+import { extractEmail, formatFileSize } from "../utils";
 
 interface FeatureProps {
-  view: FeatureType;
   inputText: string;
   outputText: string;
   isLoading: boolean;
@@ -19,7 +18,7 @@ interface FeatureProps {
   animating: boolean;
   closing: boolean;
   replyTo: GmailMessage | null;
-  toast: ToastType | null;
+  toast: ToastNotification | null;
   onInputChange: (text: string) => void;
   onOutputChange: (text: string) => void;
   onToneChange: (tone: EmailTone) => void;
@@ -28,16 +27,10 @@ interface FeatureProps {
   onSendReply: () => void;
   onNavigate: (target: ViewState) => void;
   onKeyDown: (e: React.KeyboardEvent) => void;
-}
-
-// 이메일에서 실제 주소만 추출
-function extractEmail(from: string): string {
-  const match = from.match(/<([^>]+)>/);
-  return match ? match[1] : from;
+  onDownloadAttachment?: (messageId: string, attachmentId: string, filename: string) => Promise<string>;
 }
 
 export function Feature({
-  view,
   inputText,
   outputText,
   isLoading,
@@ -58,8 +51,9 @@ export function Feature({
   onSendReply,
   onNavigate,
   onKeyDown,
+  onDownloadAttachment,
 }: FeatureProps) {
-  const feature = FEATURES.find((f) => f.id === view);
+  const [downloadingId, setDownloadingId] = useState<string | null>(null);
 
   function handleHeaderDrag(e: React.MouseEvent) {
     if (e.button === 0) {
@@ -86,8 +80,8 @@ export function Feature({
           ←
         </button>
         <div className="feature-title">
-          <span className="feature-icon">{feature?.icon}</span>
-          <span className="feature-name">{feature?.label}</span>
+          <span className="feature-icon">💬</span>
+          <span className="feature-name">이메일 답변</span>
         </div>
         <div className={`connection-status ${ollamaStatus ? "online" : "offline"}`}>
           <span className="status-dot-small" />
@@ -100,28 +94,58 @@ export function Feature({
           <textarea
             value={inputText}
             onChange={(e) => onInputChange(e.target.value)}
-            placeholder={feature?.desc || "내용을 입력하세요..."}
+            placeholder="받은 메일에 답장 작성"
             disabled={isLoading}
           />
         </div>
 
-        {view === "email-reply" && (
-          <div className="tone-section">
-            <label className="tone-label">답변 톤</label>
-            <div className="tone-buttons">
-              {TONE_OPTIONS.map((t) => (
-                <button
-                  key={t.value}
-                  className={`tone-btn ${selectedTone === t.value ? "active" : ""}`}
-                  onClick={() => onToneChange(t.value)}
-                  disabled={isLoading}
-                >
-                  {t.label}
-                </button>
+        {replyTo && replyTo.attachments && replyTo.attachments.length > 0 && (
+          <div className="attachments-section">
+            <label className="attachments-label">📎 첨부파일 ({replyTo.attachments.length})</label>
+            <div className="attachments-list">
+              {replyTo.attachments.map((att) => (
+                <div key={att.id} className="attachment-item">
+                  <div className="attachment-info">
+                    <span className="attachment-name">{att.filename}</span>
+                    <span className="attachment-size">{formatFileSize(att.size)}</span>
+                  </div>
+                  {onDownloadAttachment && (
+                    <button
+                      className="attachment-download-btn"
+                      onClick={async () => {
+                        setDownloadingId(att.id);
+                        try {
+                          await onDownloadAttachment(replyTo.id, att.id, att.filename);
+                        } finally {
+                          setDownloadingId(null);
+                        }
+                      }}
+                      disabled={downloadingId === att.id}
+                    >
+                      {downloadingId === att.id ? "⏳" : "⬇️"}
+                    </button>
+                  )}
+                </div>
               ))}
             </div>
           </div>
         )}
+
+        <div className="tone-section">
+          <label className="tone-label">답변 톤</label>
+          <div className="tone-buttons">
+            {TONE_OPTIONS.map((t) => (
+              <button
+                key={t.value}
+                className={`tone-btn ${selectedTone === t.value ? "active" : ""}`}
+                onClick={() => onToneChange(t.value)}
+                disabled={isLoading}
+              >
+                {t.label}
+              </button>
+            ))}
+          </div>
+        </div>
 
         <button
           className="generate-btn"
@@ -159,7 +183,7 @@ export function Feature({
               onChange={(e) => onOutputChange(e.target.value)}
               disabled={isSending}
             />
-            {view === "email-reply" && replyTo && (
+            {replyTo && (
               <div className="reply-actions">
                 <div className="reply-info">
                   <div className="reply-to">

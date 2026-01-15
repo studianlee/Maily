@@ -11,7 +11,7 @@ use chrono::Utc;
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Manager, WindowEvent, State, Emitter,
+    Manager, WindowEvent, State, Emitter, AppHandle,
 };
 use serde::{Deserialize, Serialize};
 
@@ -90,6 +90,15 @@ pub struct GoogleTokenResponse {
     pub token_type: String,
 }
 
+// 첨부파일 정보
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Attachment {
+    pub id: String,
+    pub filename: String,
+    pub mime_type: String,
+    pub size: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GmailMessage {
     pub id: String,
@@ -100,6 +109,9 @@ pub struct GmailMessage {
     pub snippet: String,
     pub body: Option<String>,
     pub is_unread: bool,
+    pub labels: Vec<String>,
+    #[serde(default)]
+    pub attachments: Vec<Attachment>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -151,13 +163,18 @@ struct GmailHeader {
 #[derive(Debug, Serialize, Deserialize)]
 struct GmailBody {
     data: Option<String>,
+    #[serde(rename = "attachmentId")]
+    attachment_id: Option<String>,
+    size: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct GmailPart {
     #[serde(rename = "mimeType")]
     mime_type: String,
+    filename: Option<String>,
     body: GmailBody,
+    parts: Option<Vec<GmailPart>>,
 }
 
 // Outlook 메시지 타입
@@ -175,6 +192,10 @@ pub struct OutlookMessage {
     pub body: Option<OutlookBody>,
     #[serde(rename = "isRead")]
     pub is_read: Option<bool>,
+    #[serde(rename = "inferenceClassification")]
+    pub inference_classification: Option<String>,
+    #[serde(default)]
+    pub categories: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -219,6 +240,26 @@ pub struct OutlookMessageSimple {
     pub snippet: String,
     pub body: Option<String>,
     pub is_unread: bool,
+    pub labels: Vec<String>,
+    #[serde(default)]
+    pub attachments: Vec<Attachment>,
+}
+
+// Outlook 첨부파일 API 응답
+#[derive(Debug, Serialize, Deserialize)]
+struct OutlookAttachment {
+    id: String,
+    name: String,
+    #[serde(rename = "contentType")]
+    content_type: String,
+    size: u64,
+    #[serde(rename = "contentBytes")]
+    content_bytes: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct OutlookAttachmentsResponse {
+    value: Option<Vec<OutlookAttachment>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -624,6 +665,8 @@ async fn get_gmail_messages(
                     snippet: detail.snippet,
                     body: None,
                     is_unread,
+                    labels: detail.label_ids,
+                    attachments: Vec::new(), // 목록에서는 첨부파일 정보 생략
                 });
             }
         }
@@ -677,6 +720,7 @@ async fn get_gmail_message_detail(
     // 본문 추출
     let body = extract_body(&detail.payload);
     let is_unread = detail.label_ids.iter().any(|l| l == "UNREAD");
+    let attachments = extract_attachments(&detail.payload);
 
     Ok(GmailMessage {
         id: detail.id,
@@ -687,6 +731,8 @@ async fn get_gmail_message_detail(
         snippet: detail.snippet,
         body: Some(body),
         is_unread,
+        labels: detail.label_ids,
+        attachments,
     })
 }
 
@@ -722,26 +768,118 @@ fn decode_base64(data: &str) -> String {
         .unwrap_or_default()
 }
 
+fn extract_attachments(payload: &GmailPayload) -> Vec<Attachment> {
+    let mut attachments = Vec::new();
+
+    fn collect_attachments(parts: &[GmailPart], attachments: &mut Vec<Attachment>) {
+        for part in parts {
+            // 첨부파일인 경우 (attachmentId가 있고 filename이 있는 경우)
+            if let Some(attachment_id) = &part.body.attachment_id {
+                if let Some(filename) = &part.filename {
+                    if !filename.is_empty() {
+                        attachments.push(Attachment {
+                            id: attachment_id.clone(),
+                            filename: filename.clone(),
+                            mime_type: part.mime_type.clone(),
+                            size: part.body.size.unwrap_or(0),
+                        });
+                    }
+                }
+            }
+            // 중첩된 parts가 있으면 재귀적으로 탐색
+            if let Some(nested_parts) = &part.parts {
+                collect_attachments(nested_parts, attachments);
+            }
+        }
+    }
+
+    if let Some(parts) = &payload.parts {
+        collect_attachments(parts, &mut attachments);
+    }
+
+    attachments
+}
+
+// 첨부파일 업로드용 구조체
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttachmentUpload {
+    pub filename: String,
+    pub mime_type: String,
+    pub data: String, // Base64 encoded
+}
+
 #[tauri::command]
 async fn send_gmail(
     state: State<'_, GoogleAuthState>,
     to: String,
     subject: String,
     body: String,
+    cc: Option<String>,
+    bcc: Option<String>,
+    attachments: Option<Vec<AttachmentUpload>>,
 ) -> Result<String, String> {
     let access_token = state.access_token.lock().unwrap().clone()
         .ok_or("로그인이 필요합니다")?;
 
     let client = reqwest::Client::new();
-
-    // RFC 2822 형식의 이메일 생성
-    let email = format!(
-        "To: {}\r\nSubject: {}\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{}",
-        to, subject, body
-    );
-
-    // Base64 URL-safe 인코딩
     use base64::{Engine as _, engine::general_purpose};
+
+    let email = if let Some(atts) = attachments.filter(|a| !a.is_empty()) {
+        // MIME multipart 이메일 생성
+        let boundary = format!("boundary_{}", chrono::Utc::now().timestamp_millis());
+        let mut mime_parts = Vec::new();
+
+        // 헤더
+        let mut headers = format!(
+            "To: {}\r\nSubject: {}\r\nMIME-Version: 1.0\r\n",
+            to, subject
+        );
+        if let Some(ref cc_addr) = cc {
+            if !cc_addr.is_empty() {
+                headers.push_str(&format!("Cc: {}\r\n", cc_addr));
+            }
+        }
+        if let Some(ref bcc_addr) = bcc {
+            if !bcc_addr.is_empty() {
+                headers.push_str(&format!("Bcc: {}\r\n", bcc_addr));
+            }
+        }
+        headers.push_str(&format!("Content-Type: multipart/mixed; boundary=\"{}\"\r\n\r\n", boundary));
+        mime_parts.push(headers);
+
+        // 본문 파트
+        mime_parts.push(format!(
+            "--{}\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{}\r\n",
+            boundary, body
+        ));
+
+        // 첨부파일 파트
+        for att in atts {
+            mime_parts.push(format!(
+                "--{}\r\nContent-Type: {}; name=\"{}\"\r\nContent-Disposition: attachment; filename=\"{}\"\r\nContent-Transfer-Encoding: base64\r\n\r\n{}\r\n",
+                boundary, att.mime_type, att.filename, att.filename, att.data
+            ));
+        }
+
+        mime_parts.push(format!("--{}--", boundary));
+        mime_parts.join("")
+    } else {
+        // 단순 텍스트 이메일
+        let mut email = format!("To: {}\r\n", to);
+        if let Some(ref cc_addr) = cc {
+            if !cc_addr.is_empty() {
+                email.push_str(&format!("Cc: {}\r\n", cc_addr));
+            }
+        }
+        if let Some(ref bcc_addr) = bcc {
+            if !bcc_addr.is_empty() {
+                email.push_str(&format!("Bcc: {}\r\n", bcc_addr));
+            }
+        }
+        email.push_str(&format!("Subject: {}\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{}", subject, body));
+        email
+    };
+
     let encoded = general_purpose::URL_SAFE_NO_PAD.encode(email.as_bytes());
 
     let send_body = serde_json::json!({
@@ -761,6 +899,44 @@ async fn send_gmail(
     } else {
         let error_text = response.text().await.unwrap_or_default();
         Err(format!("메일 전송 실패: {}", error_text))
+    }
+}
+
+// Gmail 중요 표시 (별표)
+#[tauri::command]
+async fn star_gmail_message(
+    state: State<'_, GoogleAuthState>,
+    message_id: String,
+    starred: bool,
+) -> Result<(), String> {
+    let access_token = state.access_token.lock().unwrap().clone()
+        .ok_or("로그인이 필요합니다")?;
+
+    let client = reqwest::Client::new();
+    let url = format!(
+        "https://gmail.googleapis.com/gmail/v1/users/me/messages/{}/modify",
+        message_id
+    );
+
+    let body = if starred {
+        serde_json::json!({ "addLabelIds": ["STARRED"] })
+    } else {
+        serde_json::json!({ "removeLabelIds": ["STARRED"] })
+    };
+
+    let response = client
+        .post(&url)
+        .bearer_auth(&access_token)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("중요 표시 실패: {}", e))?;
+
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        let error_text = response.text().await.unwrap_or_default();
+        Err(format!("중요 표시 실패: {}", error_text))
     }
 }
 
@@ -796,6 +972,127 @@ async fn mark_as_read(
         let error_text = response.text().await.unwrap_or_default();
         Err(format!("읽음 처리 실패: {}", error_text))
     }
+}
+
+#[tauri::command]
+async fn delete_gmail_message(
+    state: State<'_, GoogleAuthState>,
+    message_id: String,
+) -> Result<(), String> {
+    let access_token = state.access_token.lock().unwrap().clone()
+        .ok_or("로그인이 필요합니다")?;
+
+    let client = reqwest::Client::new();
+    let url = format!(
+        "https://gmail.googleapis.com/gmail/v1/users/me/messages/{}/trash",
+        message_id
+    );
+
+    let response = client
+        .post(&url)
+        .bearer_auth(&access_token)
+        .send()
+        .await
+        .map_err(|e| format!("삭제 실패: {}", e))?;
+
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        let error_text = response.text().await.unwrap_or_default();
+        Err(format!("삭제 실패: {}", error_text))
+    }
+}
+
+#[tauri::command]
+async fn archive_gmail_message(
+    state: State<'_, GoogleAuthState>,
+    message_id: String,
+) -> Result<(), String> {
+    let access_token = state.access_token.lock().unwrap().clone()
+        .ok_or("로그인이 필요합니다")?;
+
+    let client = reqwest::Client::new();
+    let url = format!(
+        "https://gmail.googleapis.com/gmail/v1/users/me/messages/{}/modify",
+        message_id
+    );
+
+    let body = serde_json::json!({
+        "removeLabelIds": ["INBOX"]
+    });
+
+    let response = client
+        .post(&url)
+        .bearer_auth(&access_token)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("보관 실패: {}", e))?;
+
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        let error_text = response.text().await.unwrap_or_default();
+        Err(format!("보관 실패: {}", error_text))
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct GmailAttachmentResponse {
+    size: u64,
+    data: String,
+}
+
+#[tauri::command]
+async fn download_gmail_attachment(
+    state: State<'_, GoogleAuthState>,
+    app: tauri::AppHandle,
+    message_id: String,
+    attachment_id: String,
+    filename: String,
+) -> Result<String, String> {
+    let access_token = state.access_token.lock().unwrap().clone()
+        .ok_or("로그인이 필요합니다")?;
+
+    let client = reqwest::Client::new();
+    let url = format!(
+        "https://gmail.googleapis.com/gmail/v1/users/me/messages/{}/attachments/{}",
+        message_id, attachment_id
+    );
+
+    let response = client
+        .get(&url)
+        .bearer_auth(&access_token)
+        .send()
+        .await
+        .map_err(|e| format!("첨부파일 다운로드 실패: {}", e))?;
+
+    if !response.status().is_success() {
+        let error_text = response.text().await.unwrap_or_default();
+        return Err(format!("첨부파일 다운로드 실패: {}", error_text));
+    }
+
+    let attachment_data: GmailAttachmentResponse = response
+        .json()
+        .await
+        .map_err(|e| format!("첨부파일 파싱 실패: {}", e))?;
+
+    // Base64 URL-safe 디코딩
+    use base64::{Engine as _, engine::general_purpose};
+    let decoded_data = attachment_data.data.replace('-', "+").replace('_', "/");
+    let file_bytes = general_purpose::STANDARD
+        .decode(&decoded_data)
+        .map_err(|e| format!("Base64 디코딩 실패: {}", e))?;
+
+    // 다운로드 폴더에 저장
+    let download_dir = app.path().download_dir()
+        .map_err(|_| "다운로드 폴더를 찾을 수 없습니다".to_string())?;
+
+    let file_path = download_dir.join(&filename);
+    fs::write(&file_path, &file_bytes)
+        .map_err(|e| format!("파일 저장 실패: {}", e))?;
+
+    Ok(file_path.to_string_lossy().to_string())
 }
 
 #[tauri::command]
@@ -1127,7 +1424,7 @@ async fn get_outlook_messages(
     let max = max_results.unwrap_or(20);
 
     let mut url = format!(
-        "https://graph.microsoft.com/v1.0/me/messages?$top={}&$orderby=receivedDateTime desc&$select=id,conversationId,subject,from,receivedDateTime,bodyPreview,isRead",
+        "https://graph.microsoft.com/v1.0/me/messages?$top={}&$orderby=receivedDateTime desc&$select=id,conversationId,subject,from,receivedDateTime,bodyPreview,isRead,inferenceClassification,categories",
         max
     );
 
@@ -1163,6 +1460,12 @@ async fn get_outlook_messages(
                 })
                 .unwrap_or_default();
 
+            // Outlook 라벨 생성: inferenceClassification + categories
+            let mut labels = m.categories;
+            if let Some(classification) = m.inference_classification {
+                labels.push(format!("INFERENCE_{}", classification.to_uppercase()));
+            }
+
             OutlookMessageSimple {
                 id: m.id,
                 conversation_id: m.conversation_id.unwrap_or_default(),
@@ -1172,6 +1475,8 @@ async fn get_outlook_messages(
                 snippet: m.body_preview.unwrap_or_default(),
                 body: None,
                 is_unread: !m.is_read.unwrap_or(true),
+                labels,
+                attachments: Vec::new(), // 목록에서는 첨부파일 정보 생략
             }
         })
         .collect();
@@ -1192,7 +1497,7 @@ async fn get_outlook_message_detail(
 
     let client = reqwest::Client::new();
     let url = format!(
-        "https://graph.microsoft.com/v1.0/me/messages/{}?$select=id,conversationId,subject,from,receivedDateTime,bodyPreview,body,isRead",
+        "https://graph.microsoft.com/v1.0/me/messages/{}?$select=id,conversationId,subject,from,receivedDateTime,bodyPreview,body,isRead,inferenceClassification,categories",
         message_id
     );
 
@@ -1217,6 +1522,42 @@ async fn get_outlook_message_detail(
 
     let body = m.body.and_then(|b| b.content);
 
+    // Outlook 라벨 생성
+    let mut labels = m.categories;
+    if let Some(classification) = m.inference_classification {
+        labels.push(format!("INFERENCE_{}", classification.to_uppercase()));
+    }
+
+    // 첨부파일 목록 가져오기
+    let attachments_url = format!(
+        "https://graph.microsoft.com/v1.0/me/messages/{}/attachments?$select=id,name,contentType,size",
+        message_id
+    );
+
+    let attachments = match client
+        .get(&attachments_url)
+        .bearer_auth(&access_token)
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            if let Ok(att_resp) = resp.json::<OutlookAttachmentsResponse>().await {
+                att_resp.value.unwrap_or_default()
+                    .into_iter()
+                    .map(|a| Attachment {
+                        id: a.id,
+                        filename: a.name,
+                        mime_type: a.content_type,
+                        size: a.size,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        }
+        Err(_) => Vec::new(),
+    };
+
     Ok(OutlookMessageSimple {
         id: m.id,
         conversation_id: m.conversation_id.unwrap_or_default(),
@@ -1226,6 +1567,8 @@ async fn get_outlook_message_detail(
         snippet: m.body_preview.unwrap_or_default(),
         body,
         is_unread: !m.is_read.unwrap_or(true),
+        labels,
+        attachments,
     })
 }
 
@@ -1235,27 +1578,72 @@ async fn send_outlook(
     to: String,
     subject: String,
     body: String,
+    cc: Option<String>,
+    bcc: Option<String>,
+    attachments: Option<Vec<AttachmentUpload>>,
 ) -> Result<String, String> {
     let access_token = state.access_token.lock().unwrap().clone()
         .ok_or("Outlook 로그인이 필요합니다")?;
 
     let client = reqwest::Client::new();
 
-    let email_body = serde_json::json!({
-        "message": {
-            "subject": subject,
-            "body": {
-                "contentType": "Text",
-                "content": body
-            },
-            "toRecipients": [
-                {
-                    "emailAddress": {
-                        "address": to
-                    }
-                }
-            ]
+    let mut message = serde_json::json!({
+        "subject": subject,
+        "body": {
+            "contentType": "Text",
+            "content": body
         },
+        "toRecipients": [
+            {
+                "emailAddress": {
+                    "address": to
+                }
+            }
+        ]
+    });
+
+    // CC 추가
+    if let Some(ref cc_addr) = cc {
+        if !cc_addr.is_empty() {
+            let cc_recipients: Vec<serde_json::Value> = cc_addr
+                .split(',')
+                .map(|addr| serde_json::json!({
+                    "emailAddress": { "address": addr.trim() }
+                }))
+                .collect();
+            message["ccRecipients"] = serde_json::json!(cc_recipients);
+        }
+    }
+
+    // BCC 추가
+    if let Some(ref bcc_addr) = bcc {
+        if !bcc_addr.is_empty() {
+            let bcc_recipients: Vec<serde_json::Value> = bcc_addr
+                .split(',')
+                .map(|addr| serde_json::json!({
+                    "emailAddress": { "address": addr.trim() }
+                }))
+                .collect();
+            message["bccRecipients"] = serde_json::json!(bcc_recipients);
+        }
+    }
+
+    // 첨부파일 추가
+    if let Some(atts) = attachments.filter(|a| !a.is_empty()) {
+        let attachments_json: Vec<serde_json::Value> = atts
+            .into_iter()
+            .map(|att| serde_json::json!({
+                "@odata.type": "#microsoft.graph.fileAttachment",
+                "name": att.filename,
+                "contentType": att.mime_type,
+                "contentBytes": att.data
+            }))
+            .collect();
+        message["attachments"] = serde_json::json!(attachments_json);
+    }
+
+    let email_body = serde_json::json!({
+        "message": message,
         "saveToSentItems": "true"
     });
 
@@ -1272,6 +1660,44 @@ async fn send_outlook(
     } else {
         let error_text = response.text().await.unwrap_or_default();
         Err(format!("메일 전송 실패: {}", error_text))
+    }
+}
+
+// Outlook 중요 표시 (플래그)
+#[tauri::command]
+async fn flag_outlook_message(
+    state: State<'_, MicrosoftAuthState>,
+    message_id: String,
+    flagged: bool,
+) -> Result<(), String> {
+    let access_token = state.access_token.lock().unwrap().clone()
+        .ok_or("Outlook 로그인이 필요합니다")?;
+
+    let client = reqwest::Client::new();
+    let url = format!(
+        "https://graph.microsoft.com/v1.0/me/messages/{}",
+        message_id
+    );
+
+    let body = serde_json::json!({
+        "flag": {
+            "flagStatus": if flagged { "flagged" } else { "notFlagged" }
+        }
+    });
+
+    let response = client
+        .patch(&url)
+        .bearer_auth(&access_token)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("플래그 설정 실패: {}", e))?;
+
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        let error_text = response.text().await.unwrap_or_default();
+        Err(format!("플래그 설정 실패: {}", error_text))
     }
 }
 
@@ -1307,6 +1733,125 @@ async fn mark_outlook_as_read(
         let error_text = response.text().await.unwrap_or_default();
         Err(format!("읽음 처리 실패: {}", error_text))
     }
+}
+
+#[tauri::command]
+async fn delete_outlook_message(
+    state: State<'_, MicrosoftAuthState>,
+    message_id: String,
+) -> Result<(), String> {
+    let access_token = state.access_token.lock().unwrap().clone()
+        .ok_or("Outlook 로그인이 필요합니다")?;
+
+    let client = reqwest::Client::new();
+    let url = format!(
+        "https://graph.microsoft.com/v1.0/me/messages/{}",
+        message_id
+    );
+
+    let response = client
+        .delete(&url)
+        .bearer_auth(&access_token)
+        .send()
+        .await
+        .map_err(|e| format!("삭제 실패: {}", e))?;
+
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        let error_text = response.text().await.unwrap_or_default();
+        Err(format!("삭제 실패: {}", error_text))
+    }
+}
+
+#[tauri::command]
+async fn archive_outlook_message(
+    state: State<'_, MicrosoftAuthState>,
+    message_id: String,
+) -> Result<(), String> {
+    let access_token = state.access_token.lock().unwrap().clone()
+        .ok_or("Outlook 로그인이 필요합니다")?;
+
+    let client = reqwest::Client::new();
+
+    // Outlook에서는 Archive 폴더로 이동
+    let url = format!(
+        "https://graph.microsoft.com/v1.0/me/messages/{}/move",
+        message_id
+    );
+
+    let body = serde_json::json!({
+        "destinationId": "archive"
+    });
+
+    let response = client
+        .post(&url)
+        .bearer_auth(&access_token)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("보관 실패: {}", e))?;
+
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        let error_text = response.text().await.unwrap_or_default();
+        Err(format!("보관 실패: {}", error_text))
+    }
+}
+
+#[tauri::command]
+async fn download_outlook_attachment(
+    state: State<'_, MicrosoftAuthState>,
+    app: tauri::AppHandle,
+    message_id: String,
+    attachment_id: String,
+    filename: String,
+) -> Result<String, String> {
+    let access_token = state.access_token.lock().unwrap().clone()
+        .ok_or("Outlook 로그인이 필요합니다")?;
+
+    let client = reqwest::Client::new();
+    let url = format!(
+        "https://graph.microsoft.com/v1.0/me/messages/{}/attachments/{}",
+        message_id, attachment_id
+    );
+
+    let response = client
+        .get(&url)
+        .bearer_auth(&access_token)
+        .send()
+        .await
+        .map_err(|e| format!("첨부파일 다운로드 실패: {}", e))?;
+
+    if !response.status().is_success() {
+        let error_text = response.text().await.unwrap_or_default();
+        return Err(format!("첨부파일 다운로드 실패: {}", error_text));
+    }
+
+    let attachment: OutlookAttachment = response
+        .json()
+        .await
+        .map_err(|e| format!("첨부파일 파싱 실패: {}", e))?;
+
+    let content_bytes = attachment.content_bytes
+        .ok_or("첨부파일 데이터가 없습니다")?;
+
+    // Base64 디코딩
+    use base64::{Engine as _, engine::general_purpose};
+    let file_bytes = general_purpose::STANDARD
+        .decode(&content_bytes)
+        .map_err(|e| format!("Base64 디코딩 실패: {}", e))?;
+
+    // 다운로드 폴더에 저장
+    let download_dir = app.path().download_dir()
+        .map_err(|_| "다운로드 폴더를 찾을 수 없습니다".to_string())?;
+
+    let file_path = download_dir.join(&filename);
+    fs::write(&file_path, &file_bytes)
+        .map_err(|e| format!("파일 저장 실패: {}", e))?;
+
+    Ok(file_path.to_string_lossy().to_string())
 }
 
 #[tauri::command]
@@ -1813,6 +2358,181 @@ async fn send_outlook_internal(
     }
 }
 
+// === 백그라운드 스케줄러 ===
+
+// 토큰으로 직접 Gmail 발송
+async fn send_gmail_with_token(
+    access_token: &str,
+    to: &str,
+    subject: &str,
+    body: &str,
+) -> Result<String, String> {
+    let client = reqwest::Client::new();
+
+    let email = format!(
+        "To: {}\r\nSubject: {}\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{}",
+        to, subject, body
+    );
+
+    use base64::{Engine as _, engine::general_purpose};
+    let encoded = general_purpose::URL_SAFE_NO_PAD.encode(email.as_bytes());
+
+    let send_body = serde_json::json!({
+        "raw": encoded
+    });
+
+    let response = client
+        .post("https://gmail.googleapis.com/gmail/v1/users/me/messages/send")
+        .bearer_auth(access_token)
+        .json(&send_body)
+        .send()
+        .await
+        .map_err(|e| format!("메일 전송 실패: {}", e))?;
+
+    if response.status().is_success() {
+        Ok("메일이 전송되었습니다".to_string())
+    } else {
+        let error_text = response.text().await.unwrap_or_default();
+        Err(format!("메일 전송 실패: {}", error_text))
+    }
+}
+
+// 토큰으로 직접 Outlook 발송
+async fn send_outlook_with_token(
+    access_token: &str,
+    to: &str,
+    subject: &str,
+    body: &str,
+) -> Result<String, String> {
+    let client = reqwest::Client::new();
+
+    let email_body = serde_json::json!({
+        "message": {
+            "subject": subject,
+            "body": {
+                "contentType": "Text",
+                "content": body
+            },
+            "toRecipients": [
+                {
+                    "emailAddress": {
+                        "address": to
+                    }
+                }
+            ]
+        },
+        "saveToSentItems": "true"
+    });
+
+    let response = client
+        .post("https://graph.microsoft.com/v1.0/me/sendMail")
+        .bearer_auth(access_token)
+        .json(&email_body)
+        .send()
+        .await
+        .map_err(|e| format!("메일 전송 실패: {}", e))?;
+
+    if response.status().is_success() {
+        Ok("메일이 전송되었습니다".to_string())
+    } else {
+        let error_text = response.text().await.unwrap_or_default();
+        Err(format!("메일 전송 실패: {}", error_text))
+    }
+}
+
+// 백그라운드에서 예약 이메일 발송 체크
+async fn background_check_scheduled(app: AppHandle) {
+    // DB에서 pending 상태이고 시간이 된 이메일 조회
+    let pending: Vec<(i64, String, String, String, String)> = {
+        let conn = match init_scheduled_db(&app) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let now = Utc::now().to_rfc3339();
+
+        let mut stmt = match conn.prepare(
+            "SELECT id, provider, to_addr, subject, body FROM scheduled_emails
+             WHERE status = 'pending' AND scheduled_at <= ?1"
+        ) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+
+        let rows = match stmt.query_map(params![now], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+        }) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+
+        rows.filter_map(|e| e.ok()).collect()
+    };
+
+    if pending.is_empty() {
+        return;
+    }
+
+    // State에서 토큰 가져오기
+    let google_state = app.state::<GoogleAuthState>();
+    let ms_state = app.state::<MicrosoftAuthState>();
+
+    let gmail_token = google_state.access_token.lock().unwrap().clone();
+    let outlook_token = ms_state.access_token.lock().unwrap().clone();
+
+    for (id, provider, to, subject, body) in pending {
+        let result = if provider == "gmail" {
+            if let Some(ref token) = gmail_token {
+                send_gmail_with_token(token, &to, &subject, &body).await
+            } else {
+                Err("Gmail 로그인이 필요합니다".to_string())
+            }
+        } else {
+            if let Some(ref token) = outlook_token {
+                send_outlook_with_token(token, &to, &subject, &body).await
+            } else {
+                Err("Outlook 로그인이 필요합니다".to_string())
+            }
+        };
+
+        // 결과 업데이트
+        if let Ok(conn) = init_scheduled_db(&app) {
+            match &result {
+                Ok(_) => {
+                    conn.execute(
+                        "UPDATE scheduled_emails SET status = 'sent' WHERE id = ?1",
+                        params![id],
+                    ).ok();
+                    // 프론트엔드에 알림
+                    let _ = app.emit("scheduled-email-sent", id);
+                }
+                Err(e) => {
+                    conn.execute(
+                        "UPDATE scheduled_emails SET status = 'failed', error_message = ?1 WHERE id = ?2",
+                        params![e.clone(), id],
+                    ).ok();
+                    let _ = app.emit("scheduled-email-failed", serde_json::json!({"id": id, "error": e}));
+                }
+            }
+        }
+    }
+}
+
+// 백그라운드 스케줄러 시작
+fn start_background_scheduler(app: AppHandle) {
+    let app_handle = app.clone();
+
+    // Tauri의 async runtime 사용
+    tauri::async_runtime::spawn(async move {
+        loop {
+            // 1분 대기
+            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+
+            // 예약 이메일 체크 및 발송
+            background_check_scheduled(app_handle.clone()).await;
+        }
+    });
+}
+
 pub fn run() {
     // .env 파일에서 환경변수 로드 (개발 환경)
     let _ = dotenvy::dotenv();
@@ -1826,6 +2546,7 @@ pub fn run() {
         .plugin(tauri_plugin_sql::Builder::default().build())
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_store::Builder::default().build())
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             // Create tray menu
             let quit_item = MenuItem::with_id(app, "quit", "Quit Maily", true, None::<&str>)?;
@@ -1871,6 +2592,9 @@ pub fn run() {
                 let _ = window.show();
             }
 
+            // 백그라운드 스케줄러 시작 (예약 이메일 발송)
+            start_background_scheduler(app.handle().clone());
+
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -1895,6 +2619,10 @@ pub fn run() {
             get_gmail_message_detail,
             send_gmail,
             mark_as_read,
+            delete_gmail_message,
+            archive_gmail_message,
+            download_gmail_attachment,
+            star_gmail_message,
             is_gmail_authenticated,
             set_gmail_tokens,
             logout_gmail,
@@ -1911,6 +2639,10 @@ pub fn run() {
             get_outlook_message_detail,
             send_outlook,
             mark_outlook_as_read,
+            delete_outlook_message,
+            archive_outlook_message,
+            download_outlook_attachment,
+            flag_outlook_message,
             is_outlook_authenticated,
             logout_outlook,
             save_outlook_tokens,

@@ -2,10 +2,11 @@ import { useState, useEffect, useCallback } from "react";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import "./App.css";
 
-import type { GmailMessage, EmailProvider } from "./types";
+import type { GmailMessage, EmailProvider, AttachmentUpload } from "./types";
 import type { FeatureType, ViewState, EmailTone } from "./constants";
-import { useToast, useGmail, useOutlook, useAI, useWindowManager, useNavigation, useScheduledEmail } from "./hooks";
-import { Logo, Menu, Inbox, Feature, NewEmail } from "./components";
+import { useToast, useGmail, useOutlook, useAI, useWindowManager, useNavigation, useScheduledEmail, useInternalDomains } from "./hooks";
+import { extractEmail } from "./utils";
+import { Logo, Menu, Inbox, Feature, NewEmail, ScheduledList, Settings } from "./components";
 
 function App() {
   // Hooks
@@ -15,6 +16,7 @@ function App() {
   const ai = useAI();
   const windowManager = useWindowManager();
   const scheduledEmail = useScheduledEmail();
+  const internalDomains = useInternalDomains();
 
   // 이메일 제공자 상태
   const [emailProvider, setEmailProvider] = useState<EmailProvider | null>(null);
@@ -29,6 +31,9 @@ function App() {
   // 새 이메일 작성 상태
   const [newEmailTo, setNewEmailTo] = useState("");
   const [newEmailSubject, setNewEmailSubject] = useState("");
+  const [newEmailCc, setNewEmailCc] = useState("");
+  const [newEmailBcc, setNewEmailBcc] = useState("");
+  const [newEmailAttachments, setNewEmailAttachments] = useState<AttachmentUpload[]>([]);
 
   const navigation = useNavigation({
     onShortcutActivate: (text) => {
@@ -49,6 +54,9 @@ function App() {
     if (target === "new-email") {
       setNewEmailTo("");
       setNewEmailSubject("");
+      setNewEmailCc("");
+      setNewEmailBcc("");
+      setNewEmailAttachments([]);
       setInputText("");
       ai.clearOutput();
     }
@@ -129,12 +137,6 @@ function App() {
     activeEmail.setError("로그인이 취소되었습니다.");
   }
 
-  // 이메일 주소 추출
-  function extractEmail(from: string): string {
-    const match = from.match(/<([^>]+)>/);
-    return match ? match[1] : from;
-  }
-
   // 답장 전송
   async function sendReply() {
     if (!replyTo || !ai.output.trim()) return;
@@ -172,12 +174,22 @@ function App() {
       setIsSending(true);
       ai.setError(null);
 
-      await activeEmail.sendEmail(newEmailTo.trim(), newEmailSubject.trim(), ai.output);
+      await activeEmail.sendEmail(
+        newEmailTo.trim(),
+        newEmailSubject.trim(),
+        ai.output,
+        newEmailCc.trim() || undefined,
+        newEmailBcc.trim() || undefined,
+        newEmailAttachments.length > 0 ? newEmailAttachments : undefined
+      );
 
       ai.clearOutput();
       setInputText("");
       setNewEmailTo("");
       setNewEmailSubject("");
+      setNewEmailCc("");
+      setNewEmailBcc("");
+      setNewEmailAttachments([]);
       setCopied(false);
       showToast("메일이 전송되었습니다", "success");
       handleGoTo("menu");
@@ -303,6 +315,7 @@ function App() {
         closing={closing}
         toast={toast}
         emailProvider={emailProvider}
+        internalDomains={internalDomains.domains}
         onNavigate={handleGoTo}
         onGmailLogin={handleGmailLogin}
         onOutlookLogin={handleOutlookLogin}
@@ -310,7 +323,113 @@ function App() {
         onLoadEmails={activeEmail.loadEmails}
         onLoadMore={activeEmail.loadMore}
         onSelectEmail={selectEmail}
+        onDeleteEmail={async (id) => {
+          try {
+            if (emailProvider === "outlook") {
+              await outlook.deleteEmail(id);
+            } else {
+              await gmail.deleteEmail(id);
+            }
+            showToast("삭제되었습니다", "success");
+          } catch (e) {
+            showToast("삭제 실패: " + e, "error");
+          }
+        }}
+        onArchiveEmail={async (id) => {
+          try {
+            if (emailProvider === "outlook") {
+              await outlook.archiveEmail(id);
+            } else {
+              await gmail.archiveEmail(id);
+            }
+            showToast("보관되었습니다", "success");
+          } catch (e) {
+            showToast("보관 실패: " + e, "error");
+          }
+        }}
+        onStarEmail={async (id, starred) => {
+          try {
+            if (emailProvider === "outlook") {
+              await outlook.flagEmail(id, starred);
+            } else {
+              await gmail.starEmail(id, starred);
+            }
+            showToast(starred ? "중요 표시됨" : "중요 해제됨", "success");
+          } catch (e) {
+            showToast("중요 표시 실패: " + e, "error");
+          }
+        }}
+        onBulkDelete={async (ids) => {
+          try {
+            for (const id of ids) {
+              if (emailProvider === "outlook") {
+                await outlook.deleteEmail(id);
+              } else {
+                await gmail.deleteEmail(id);
+              }
+            }
+            showToast(`${ids.length}개 삭제됨`, "success");
+          } catch (e) {
+            showToast("일괄 삭제 실패: " + e, "error");
+          }
+        }}
+        onBulkArchive={async (ids) => {
+          try {
+            for (const id of ids) {
+              if (emailProvider === "outlook") {
+                await outlook.archiveEmail(id);
+              } else {
+                await gmail.archiveEmail(id);
+              }
+            }
+            showToast(`${ids.length}개 보관됨`, "success");
+          } catch (e) {
+            showToast("일괄 보관 실패: " + e, "error");
+          }
+        }}
         onCancelLogin={handleCancelLogin}
+        onKeyDown={handleKeyDown}
+      />
+    );
+  }
+
+  // === 예약 메일 목록 화면 ===
+  if (view === "scheduled") {
+    return (
+      <ScheduledList
+        scheduledEmails={scheduledEmail.scheduledEmails}
+        loading={scheduledEmail.loading}
+        animating={animating}
+        closing={closing}
+        toast={toast}
+        onNavigate={handleGoTo}
+        onLoad={scheduledEmail.loadScheduledEmails}
+        onDelete={async (id) => {
+          try {
+            await scheduledEmail.deleteScheduled(id);
+            showToast("예약이 취소되었습니다", "success");
+          } catch {
+            showToast("취소 실패", "error");
+          }
+        }}
+        onKeyDown={handleKeyDown}
+      />
+    );
+  }
+
+  // === 설정 화면 ===
+  if (view === "settings") {
+    return (
+      <Settings
+        animating={animating}
+        closing={closing}
+        toast={toast}
+        emailProvider={emailProvider}
+        internalDomains={internalDomains.domains}
+        onNavigate={handleGoTo}
+        onAddDomain={internalDomains.addDomain}
+        onRemoveDomain={internalDomains.removeDomain}
+        onLogout={handleLogout}
         onKeyDown={handleKeyDown}
       />
     );
@@ -322,6 +441,8 @@ function App() {
       <NewEmail
         to={newEmailTo}
         subject={newEmailSubject}
+        cc={newEmailCc}
+        bcc={newEmailBcc}
         inputText={inputText}
         outputText={ai.output}
         isLoading={ai.loading}
@@ -334,8 +455,11 @@ function App() {
         closing={closing}
         toast={toast}
         emailProvider={emailProvider}
+        attachments={newEmailAttachments}
         onToChange={setNewEmailTo}
         onSubjectChange={setNewEmailSubject}
+        onCcChange={setNewEmailCc}
+        onBccChange={setNewEmailBcc}
         onInputChange={setInputText}
         onOutputChange={ai.setOutput}
         onToneChange={setSelectedTone}
@@ -345,14 +469,14 @@ function App() {
         onSchedule={scheduleNewEmail}
         onNavigate={handleGoTo}
         onKeyDown={handleKeyDown}
+        onAttachmentsChange={setNewEmailAttachments}
       />
     );
   }
 
-  // === 기능 화면 ===
+  // === 이메일 답변 화면 ===
   return (
     <Feature
-      view={view as FeatureType}
       inputText={inputText}
       outputText={ai.output}
       isLoading={ai.loading}
@@ -373,6 +497,16 @@ function App() {
       onSendReply={sendReply}
       onNavigate={handleGoTo}
       onKeyDown={handleKeyDown}
+      onDownloadAttachment={async (messageId, attachmentId, filename) => {
+        try {
+          const savedPath = await activeEmail.downloadAttachment(messageId, attachmentId, filename);
+          showToast(`${filename} 다운로드 완료`, "success");
+          return savedPath;
+        } catch (e) {
+          showToast("다운로드 실패: " + e, "error");
+          throw e;
+        }
+      }}
     />
   );
 }

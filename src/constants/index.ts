@@ -1,25 +1,18 @@
 // 화면 크기 설정
 export const WINDOW_SIZES = {
   logo: { width: 70, height: 70 },
-  menu: { width: 70, height: 480 },
+  menu: { width: 70, height: 340 },
   inbox: { width: 380, height: 520 },
   "new-email": { width: 420, height: 620 },
+  scheduled: { width: 380, height: 520 },
+  settings: { width: 380, height: 520 },
   feature: { width: 420, height: 620 },
 } as const;
 
-// 기능 타입
-export type FeatureType = "email-reply" | "compose" | "summarize" | "translate" | "grammar";
-export type ViewState = "logo" | "menu" | "inbox" | "new-email" | FeatureType;
+// 기능 타입 (email-reply는 inbox에서 메일 선택시 사용)
+export type FeatureType = "email-reply";
+export type ViewState = "logo" | "menu" | "inbox" | "new-email" | "scheduled" | "settings" | FeatureType;
 export type EmailTone = "accept" | "decline" | "inquiry" | "formal" | "casual";
-
-// 기능 목록
-export const FEATURES: { id: FeatureType; label: string; icon: string; desc: string }[] = [
-  { id: "email-reply", label: "이메일 답변", icon: "💬", desc: "받은 메일에 답장 작성" },
-  { id: "compose", label: "작성", icon: "✏️", desc: "새 문서 작성" },
-  { id: "summarize", label: "요약", icon: "📋", desc: "긴 텍스트 요약" },
-  { id: "translate", label: "번역", icon: "🌐", desc: "텍스트 번역" },
-  { id: "grammar", label: "맞춤법", icon: "📝", desc: "맞춤법 검사" },
-];
 
 // 답변 톤 옵션
 export const TONE_OPTIONS: { value: EmailTone; label: string; prompt: string }[] = [
@@ -47,41 +40,4 @@ OOO님, 안녕하세요.
 (핵심 내용)
 
 감사합니다.`,
-
-  compose: `당신은 전문 문서 작성가입니다.
-
-[규칙]
-- 요청된 주제에 맞는 문서를 작성합니다
-- 명확하고 논리적인 구조로 작성합니다
-- 마크다운 문법(**, ##, - 등)을 절대 사용하지 않습니다
-- 본문만 출력합니다 (제목, 설명, 부연 없이)
-- 자연스러운 문장으로 작성합니다`,
-
-  summarize: `당신은 문서 요약 전문가입니다.
-
-[규칙]
-- 핵심 내용만 추출하여 간결하게 요약합니다
-- 원문의 중요한 정보를 누락하지 않습니다
-- 3~5문장 이내로 요약합니다
-- 불필요한 수식어와 반복을 제거합니다
-- 마크다운 문법(**, ##, - 등)을 절대 사용하지 않습니다
-- 요약 결과만 출력합니다 (설명, 부연 없이)`,
-
-  translate: `당신은 전문 번역가입니다.
-
-[규칙]
-- 원문의 의미를 정확하게 전달합니다
-- 자연스러운 한국어/영어로 번역합니다
-- 의역보다 직역을 우선하되, 어색하면 의역합니다
-- 마크다운 문법(**, ##, - 등)을 절대 사용하지 않습니다
-- 번역 결과만 출력합니다 (원문, 설명, 부연 없이)`,
-
-  grammar: `당신은 맞춤법 교정 전문가입니다.
-
-[규칙]
-- 맞춤법, 띄어쓰기, 문법 오류를 교정합니다
-- 원문의 의미와 문체를 최대한 유지합니다
-- 불필요한 수정은 하지 않습니다
-- 마크다운 문법(**, ##, - 등)을 절대 사용하지 않습니다
-- 교정된 텍스트만 출력합니다 (설명, 변경사항 없이)`,
 };

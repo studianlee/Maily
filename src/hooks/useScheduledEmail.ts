@@ -1,5 +1,6 @@
 import { useState, useCallback, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
 export interface ScheduledEmail {
   id: number;
@@ -60,34 +61,27 @@ export function useScheduledEmail() {
     }
   }, []);
 
-  // 예약 이메일 발송 체크 (백그라운드)
-  const checkAndSend = useCallback(async () => {
-    try {
-      const sentIds = await invoke<number[]>("check_and_send_scheduled_emails");
-      if (sentIds.length > 0) {
-        // 발송된 이메일 상태 업데이트
-        setScheduledEmails(prev =>
-          prev.map(e => sentIds.includes(e.id) ? { ...e, status: "sent" } : e)
-        );
-      }
-      return sentIds;
-    } catch {
-      // 백그라운드 체크 실패는 무시
-      return [];
-    }
-  }, []);
-
-  // 주기적으로 발송 체크 (1분마다)
+  // 백엔드 이벤트 리스너 (백그라운드에서 발송 시 UI 업데이트)
   useEffect(() => {
-    const interval = setInterval(() => {
-      checkAndSend();
-    }, 60000);
+    const unlistenSent = listen<number>("scheduled-email-sent", (event) => {
+      const sentId = event.payload;
+      setScheduledEmails(prev =>
+        prev.map(e => e.id === sentId ? { ...e, status: "sent" } : e)
+      );
+    });
 
-    // 초기 로드 시에도 체크
-    checkAndSend();
+    const unlistenFailed = listen<{ id: number; error: string }>("scheduled-email-failed", (event) => {
+      const { id, error } = event.payload;
+      setScheduledEmails(prev =>
+        prev.map(e => e.id === id ? { ...e, status: "failed", error_message: error } : e)
+      );
+    });
 
-    return () => clearInterval(interval);
-  }, [checkAndSend]);
+    return () => {
+      unlistenSent.then(fn => fn());
+      unlistenFailed.then(fn => fn());
+    };
+  }, []);
 
   return {
     scheduledEmails,
@@ -97,6 +91,5 @@ export function useScheduledEmail() {
     loadScheduledEmails,
     createScheduled,
     deleteScheduled,
-    checkAndSend,
   };
 }

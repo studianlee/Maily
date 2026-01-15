@@ -1,6 +1,6 @@
 import { useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import type { OutlookMessage, OutlookMessagesResult } from "../types";
+import type { OutlookMessage, OutlookMessagesResult, AttachmentUpload } from "../types";
 
 export function useOutlook() {
   const [authenticated, setAuthenticated] = useState(false);
@@ -140,9 +140,53 @@ export function useOutlook() {
   }, [withTokenRefresh]);
 
   // 이메일 전송
-  const sendEmail = useCallback(async (to: string, subject: string, body: string) => {
+  const sendEmail = useCallback(async (
+    to: string,
+    subject: string,
+    body: string,
+    cc?: string,
+    bcc?: string,
+    attachments?: AttachmentUpload[]
+  ) => {
     return withTokenRefresh(() =>
-      invoke("send_outlook", { to, subject, body })
+      invoke("send_outlook", { to, subject, body, cc, bcc, attachments })
+    );
+  }, [withTokenRefresh]);
+
+  // 중요 표시 (플래그)
+  const flagEmail = useCallback(async (messageId: string, flagged: boolean) => {
+    await withTokenRefresh(() =>
+      invoke("flag_outlook_message", { messageId, flagged })
+    );
+    setEmails(prev => prev.map(e =>
+      e.id === messageId ? { ...e, is_flagged: flagged } : e
+    ));
+  }, [withTokenRefresh]);
+
+  // 이메일 삭제
+  const deleteEmail = useCallback(async (messageId: string) => {
+    await withTokenRefresh(() =>
+      invoke("delete_outlook_message", { messageId })
+    );
+    setEmails(prev => prev.filter(e => e.id !== messageId));
+  }, [withTokenRefresh]);
+
+  // 이메일 보관 (아카이브)
+  const archiveEmail = useCallback(async (messageId: string) => {
+    await withTokenRefresh(() =>
+      invoke("archive_outlook_message", { messageId })
+    );
+    setEmails(prev => prev.filter(e => e.id !== messageId));
+  }, [withTokenRefresh]);
+
+  // 첨부파일 다운로드
+  const downloadAttachment = useCallback(async (
+    messageId: string,
+    attachmentId: string,
+    filename: string
+  ): Promise<string> => {
+    return withTokenRefresh(() =>
+      invoke<string>("download_outlook_attachment", { messageId, attachmentId, filename })
     );
   }, [withTokenRefresh]);
 
@@ -163,5 +207,9 @@ export function useOutlook() {
     getMessageDetail,
     markAsRead,
     sendEmail,
+    flagEmail,
+    deleteEmail,
+    archiveEmail,
+    downloadAttachment,
   };
 }

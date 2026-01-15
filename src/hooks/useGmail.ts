@@ -1,6 +1,6 @@
 import { useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import type { GmailMessage, GmailMessagesResult } from "../types";
+import type { GmailMessage, GmailMessagesResult, AttachmentUpload } from "../types";
 
 export function useGmail() {
   const [authenticated, setAuthenticated] = useState(false);
@@ -164,9 +164,53 @@ export function useGmail() {
   }, [withTokenRefresh]);
 
   // 이메일 전송
-  const sendEmail = useCallback(async (to: string, subject: string, body: string) => {
+  const sendEmail = useCallback(async (
+    to: string,
+    subject: string,
+    body: string,
+    cc?: string,
+    bcc?: string,
+    attachments?: AttachmentUpload[]
+  ) => {
     return withTokenRefresh(() =>
-      invoke("send_gmail", { to, subject, body })
+      invoke("send_gmail", { to, subject, body, cc, bcc, attachments })
+    );
+  }, [withTokenRefresh]);
+
+  // 중요 표시 (별표)
+  const starEmail = useCallback(async (messageId: string, starred: boolean) => {
+    await withTokenRefresh(() =>
+      invoke("star_gmail_message", { messageId, starred })
+    );
+    setEmails(prev => prev.map(e =>
+      e.id === messageId ? { ...e, is_starred: starred } : e
+    ));
+  }, [withTokenRefresh]);
+
+  // 이메일 삭제 (휴지통으로 이동)
+  const deleteEmail = useCallback(async (messageId: string) => {
+    await withTokenRefresh(() =>
+      invoke("delete_gmail_message", { messageId })
+    );
+    setEmails(prev => prev.filter(e => e.id !== messageId));
+  }, [withTokenRefresh]);
+
+  // 이메일 보관 (아카이브)
+  const archiveEmail = useCallback(async (messageId: string) => {
+    await withTokenRefresh(() =>
+      invoke("archive_gmail_message", { messageId })
+    );
+    setEmails(prev => prev.filter(e => e.id !== messageId));
+  }, [withTokenRefresh]);
+
+  // 첨부파일 다운로드
+  const downloadAttachment = useCallback(async (
+    messageId: string,
+    attachmentId: string,
+    filename: string
+  ): Promise<string> => {
+    return withTokenRefresh(() =>
+      invoke<string>("download_gmail_attachment", { messageId, attachmentId, filename })
     );
   }, [withTokenRefresh]);
 
@@ -187,5 +231,9 @@ export function useGmail() {
     getMessageDetail,
     markAsRead,
     sendEmail,
+    starEmail,
+    deleteEmail,
+    archiveEmail,
+    downloadAttachment,
   };
 }

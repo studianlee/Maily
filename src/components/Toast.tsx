@@ -1,7 +1,7 @@
-import type { Toast as ToastType } from "../types";
+import type { ToastNotification } from "../types";
 
 interface ToastProps {
-  toast: ToastType | null;
+  toast: ToastNotification | null;
 }
 
 export function Toast({ toast }: ToastProps) {

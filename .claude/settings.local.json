@@ -11,7 +11,9 @@
       "Bash(cargo check:*)",
       "Bash(npm run build:*)",
       "Bash(git push)",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Bash(pushd:*)",
+      "Bash(npm install:*)"
     ]
   }
 }
